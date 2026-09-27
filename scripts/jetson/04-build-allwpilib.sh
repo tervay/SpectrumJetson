@@ -15,8 +15,7 @@ LOG=$HOME/build/allwpilib-$TAG.log
 # More parallelism OOMs on wpimath with 8 GB RAM.
 JOBS=4
 
-# JDK 17 for the build. PhotonVision 2027 installs JDK 25 as the default java;
-# pin the build to 17 explicitly instead of relying on alternatives.
+# Pin JDK 17 explicitly instead of relying on the system's Java alternatives.
 export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-arm64
 export PATH=$PATH:/usr/local/cuda/bin
 
@@ -34,6 +33,14 @@ if [[ ! -d $SRC/.git ]]; then
   git clone --depth 1 --branch "$TAG" https://github.com/wpilibsuite/allwpilib.git "$SRC"
 fi
 cd "$SRC"
+
+# A directory name alone does not establish which sources are being built.
+expected_commit=$(git rev-parse --verify "refs/tags/$TAG^{commit}")
+if [[ $(git rev-parse HEAD) != "$expected_commit" ]] ||
+   [[ -n $(git status --porcelain --untracked-files=no) ]]; then
+  echo "Refusing to build $SRC: expected a clean checkout of $TAG." >&2
+  exit 1
+fi
 
 exec > >(tee -a "$LOG") 2>&1
 echo "==> $(date) building allwpilib $TAG with -j$JOBS (log: $LOG)"

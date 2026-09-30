@@ -1,0 +1,16 @@
+--- a/photon-client/src/components/dashboard/tabs/InputTab.vue
++++ b/photon-client/src/components/dashboard/tabs/InputTab.vue
+@@ -96,10 +96,12 @@
+   cameraBacklightCompensation:
+     "Only matters with auto exposure. Leave it at the camera's default with auto exposure off."
+ };
++// updateStore true (photonvision-39): these sliders show the store's value one-way (no v-model),
++// so with false the camera changed but the slider and number snapped back to the old value.
+ const setExtraControl = (c: ExtraCameraControl, value: number | boolean) =>
+   useCameraSettingsStore().changeCurrentPipelineSetting(
+     { [c.key]: typeof value === "boolean" ? Number(value) : value },
+-    false
++    true
+   );
+ 
+ const { mdAndDown } = useDisplay();

@@ -1,0 +1,36 @@
+--- a/photon-core/src/main/java/org/photonvision/vision/processes/VisionSourceManager.java
++++ b/photon-core/src/main/java/org/photonvision/vision/processes/VisionSourceManager.java
+@@ -166,6 +166,11 @@
+             logger.error(
+                     "Camera unique-path already in use by active VisionModule! Cannot reactivate "
+                             + deactivatedConfig.get().nickname);
++            // SpectrumJetson (photonvision-44, upstream #2352): it went on and reactivated anyway,
++            // binding two modules to one device (easy with identical cameras, which only their USB
++            // port tells apart). Put the config back and refuse.
++            this.disabledCameraConfigs.put(uniqueName, deactivatedConfig.get());
++            return false;
+         }
+ 
+         // transform the camera info all the way to a VisionModule and then start it
+--- a/photon-client/src/views/CameraMatchingView.vue
++++ b/photon-client/src/views/CameraMatchingView.vue
+@@ -172,7 +172,9 @@
+         class="pr-0"
+       >
+         <v-card color="surface" class="rounded-12">
+-          <v-card-title>{{ cameraInfoFor(module.matchedCameraInfo).name }}</v-card-title>
++          <!-- photonvision-44 (upstream #2352): identical cameras all had the device name as title -->
++          <v-card-title>{{ module.nickname || cameraInfoFor(module.matchedCameraInfo).name }}</v-card-title>
++          <v-card-subtitle v-if="module.nickname">Device: {{ cameraInfoFor(module.matchedCameraInfo).name }}</v-card-subtitle>
+           <v-card-subtitle v-if="!cameraConnected(cameraInfoFor(module.matchedCameraInfo).uniquePath)"
+             >Status: <span class="inactive-status">Disconnected</span></v-card-subtitle
+           >
+@@ -488,7 +490,7 @@
+     <pv-delete-modal
+       v-model="confirmDeleteDialog.show"
+       title="Delete Camera"
+-      :description="`Are you sure you want to delete the camera '${useCameraSettingsStore().currentCameraSettings.nickname}'? This action cannot be undone.`"
++      :description="`Are you sure you want to delete the camera '${confirmDeleteDialog.nickname}'? This action cannot be undone.`"
+       :expected-confirmation-text="confirmDeleteDialog.nickname"
+       :on-confirm="() => deleteThisCamera(confirmDeleteDialog.cameraUniqueName)"
+     />

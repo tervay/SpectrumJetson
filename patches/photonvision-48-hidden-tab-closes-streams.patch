@@ -1,0 +1,70 @@
+diff --git a/photon-client/src/components/app/photon-camera-stream.vue b/photon-client/src/components/app/photon-camera-stream.vue
+index 5e148534..54ea3780 100644
+--- a/photon-client/src/components/app/photon-camera-stream.vue
++++ b/photon-client/src/components/app/photon-camera-stream.vue
+@@ -14,14 +14,25 @@ const props = defineProps<{
+ }>();
+ 
+ const emptyStreamSrc = "//:0";
++// SpectrumJetson (photonvision-48): a hidden tab (another tab in front, or the window minimised)
++// drops its stream connections, so the Jetson stops encoding frames nobody sees (photonvision-15
++// encodes only while a stream has a viewer). They reconnect when the tab is shown again.
++const pageVisible = ref(document.visibilityState !== "hidden");
++// inject() only works during setup: called inside the computed below, any later recompute
++// (tab shown again, backend reconnected after a restart) built http://undefined:PORT.
++const backendHostname = inject("backendHostname");
++const onVisibilityChange = () => {
++  pageVisible.value = document.visibilityState !== "hidden";
++};
++document.addEventListener("visibilitychange", onVisibilityChange);
+ const streamSrc = computed<string>(() => {
+   const port = props.cameraSettings.stream[props.streamType === "Raw" ? "inputPort" : "outputPort"];
+ 
+-  if (!useStateStore().backendConnected || port === 0) {
++  if (!useStateStore().backendConnected || port === 0 || !pageVisible.value) {
+     return emptyStreamSrc;
+   }
+ 
+-  return `http://${inject("backendHostname")}:${port}/stream.mjpg`;
++  return `http://${backendHostname}:${port}/stream.mjpg`;
+ });
+ const streamDesc = computed<string>(() => `${props.streamType} Stream View`);
+ const streamStyle = computed<StyleValue>(() => {
+@@ -89,6 +100,7 @@ const handleStreamError = () => {
+ };
+ 
+ onBeforeUnmount(() => {
++  document.removeEventListener("visibilitychange", onVisibilityChange);
+   if (!mjpgStream.value) return;
+   mjpgStream.value["src"] = emptyStreamSrc;
+ });
+diff --git a/photon-core/src/main/java/org/photonvision/vision/processes/VisionModule.java b/photon-core/src/main/java/org/photonvision/vision/processes/VisionModule.java
+index 7d706cc9..a7014b30 100644
+--- a/photon-core/src/main/java/org/photonvision/vision/processes/VisionModule.java
++++ b/photon-core/src/main/java/org/photonvision/vision/processes/VisionModule.java
+@@ -728,6 +728,13 @@ public class VisionModule {
+         return index;
+     }
+ 
++    /** SpectrumJetson (photonvision-48): whether each stream has a viewer, for tests/ui. */
++    public Map<String, Boolean> streamViewers() {
++        return Map.of(
++                "input", inputVideoStreamer != null && inputVideoStreamer.hasViewers(),
++                "output", outputVideoStreamer != null && outputVideoStreamer.hasViewers());
++    }
++
+     boolean setPipeline(int index) {
+         logger.info("Setting pipeline to " + index);
+         logger.info("Pipeline name: " + pipelineManager.getPipelineNickname(index));
+diff --git a/photon-server/src/main/java/org/photonvision/server/RequestHandler.java b/photon-server/src/main/java/org/photonvision/server/RequestHandler.java
+index bc8c15ba..9931fb0c 100644
+--- a/photon-server/src/main/java/org/photonvision/server/RequestHandler.java
++++ b/photon-server/src/main/java/org/photonvision/server/RequestHandler.java
+@@ -494,6 +494,7 @@ public class RequestHandler {
+             camera.put("pipelineNicknames", ui.pipelineNicknames);
+             camera.put("currentPipelineSettings", ui.currentPipelineSettings);
+             camera.put("extraControls", ui.extraControls);
++            camera.put("streamViewers", module.streamViewers());
+             // Every pipeline's saved settings, not only the running one's (photonvision-46).
+             var pipelines = new ArrayList<Object>();
+             for (int i = 0; i < ui.pipelineNicknames.size(); i++) {

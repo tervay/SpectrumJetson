@@ -1,0 +1,279 @@
+diff --git a/photon-client/src/components/settings/RobotStateCard.vue b/photon-client/src/components/settings/RobotStateCard.vue
+index 5e5eaa95..762b775b 100644
+--- a/photon-client/src/components/settings/RobotStateCard.vue
++++ b/photon-client/src/components/settings/RobotStateCard.vue
+@@ -1,23 +1,46 @@
+ <script setup lang="ts">
+ // SpectrumJetson (photonvision-50): the robot's state as PhotonVision sees it, and idle mode
+ // (photonvision-49): fewer frames while the robot is disabled, switchable for full-speed tests.
+-import { onBeforeUnmount, onMounted, ref } from "vue";
++import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+ import PvSwitch from "@/components/common/pv-switch.vue";
+ import PvSlider from "@/components/common/pv-slider.vue";
++import PvSelect, { type SelectItem } from "@/components/common/pv-select.vue";
+ import { useStateStore } from "@/stores/StateStore";
++import { useCameraSettingsStore } from "@/stores/settings/CameraSettingsStore";
+ import { useTheme } from "vuetify";
+-import { loadRobotState, robotState, setRobotState } from "@/lib/RobotState";
++import { loadRobotState, robotState, setRobotState, type RobotStateChange } from "@/lib/RobotState";
++
++// photonvision-51: each pipeline number, with what every camera has there, so a profile set up at
++// mismatched numbers shows before a match rather than during one.
++const eventPipelineItems = computed<SelectItem[]>(() => {
++  const cameras = Object.values(useCameraSettingsStore().cameras);
++  const most = Math.max(1, ...cameras.map((c) => c.pipelineNicknames?.length ?? 0));
++  return Array.from({ length: most }, (_, index) => {
++    const byName = new Map<string, string[]>();
++    const missing: string[] = [];
++    for (const c of cameras) {
++      const name = c.pipelineNicknames?.[index];
++      if (name === undefined) missing.push(c.nickname);
++      else byName.set(name, [...(byName.get(name) ?? []), c.nickname]);
++    }
++    const parts = [...byName.entries()].map(([name, on]) =>
++      on.length === cameras.length ? `${name} (every camera)` : `${name} (${on.join(", ")})`
++    );
++    if (missing.length) parts.push(`none on ${missing.join(", ")}`);
++    return { name: `${index}: ${parts.join("; ")}`, value: index };
++  });
++});
+ 
+ const theme = useTheme();
+ const busy = ref(false);
+ let timer: ReturnType<typeof setInterval> | undefined;
+ 
+-const set = async (change: { idleWhileDisabled?: boolean; idleFps?: number }) => {
++const set = async (change: RobotStateChange) => {
+   busy.value = true;
+   try {
+     await setRobotState(change);
+   } catch {
+-    useStateStore().showSnackbarMessage({ message: "Couldn't change idle mode", color: "error" });
++    useStateStore().showSnackbarMessage({ message: "Couldn't change the robot state settings", color: "error" });
+   } finally {
+     busy.value = false;
+   }
+@@ -68,6 +91,38 @@ onBeforeUnmount(() => clearInterval(timer));
+         :slider-cols="8"
+         @update:model-value="(v) => set({ idleFps: v })"
+       />
++      <v-divider class="my-3" />
++      <pv-switch
++        :model-value="robotState.eventProfileOnFms"
++        :disabled="busy"
++        label="Event pipeline when the field connects"
++        tooltip="When the field (FMS) connects, every camera switches to the pipeline number below, once. Anything after that sticks: a switch on the dashboard, robot code choosing a pipeline, or turning this off. Cameras without that number, in driver mode or calibrating are left alone."
++        :label-cols="4"
++        @update:model-value="(v) => set({ eventProfileOnFms: !!v })"
++      />
++      <pv-select
++        :model-value="robotState.eventPipeline"
++        :disabled="busy || !robotState.eventProfileOnFms"
++        label="Event pipeline"
++        tooltip="The pipeline number every camera switches to. Each entry lists what the cameras have at that number."
++        :items="eventPipelineItems"
++        :select-cols="8"
++        @update:model-value="(v) => set({ eventPipeline: Number(v) })"
++      />
++      <div class="d-flex align-center pt-2">
++        <v-btn
++          size="small"
++          variant="tonal"
++          color="buttonActive"
++          :disabled="busy || !robotState.eventProfileOnFms"
++          @click="set({ switchNow: true })"
++        >
++          Switch now
++        </v-btn>
++        <span class="text-caption pl-3" data-testid="last-event-switch">
++          {{ robotState.lastEventSwitch ? `Last: ${robotState.lastEventSwitch}` : "Not switched since PhotonVision started." }}
++        </span>
++      </div>
+     </v-card-text>
+   </v-card>
+ </template>
+diff --git a/photon-client/src/lib/RobotState.ts b/photon-client/src/lib/RobotState.ts
+index fcdef3a8..1b45a028 100644
+--- a/photon-client/src/lib/RobotState.ts
++++ b/photon-client/src/lib/RobotState.ts
+@@ -11,6 +11,18 @@ export interface RobotState {
+   autonomous: boolean;
+   fmsAttached: boolean;
+   idleNow: boolean;
++  // photonvision-51
++  eventProfileOnFms: boolean;
++  eventPipeline: number;
++  lastEventSwitch: string;
++}
++
++export interface RobotStateChange {
++  idleWhileDisabled?: boolean;
++  idleFps?: number;
++  eventProfileOnFms?: boolean;
++  eventPipeline?: number;
++  switchNow?: boolean;
+ }
+ 
+ export const robotState = ref<RobotState | null>(null);
+@@ -23,6 +35,6 @@ export const loadRobotState = async () => {
+   }
+ };
+ 
+-export const setRobotState = async (change: { idleWhileDisabled?: boolean; idleFps?: number }) => {
++export const setRobotState = async (change: RobotStateChange) => {
+   robotState.value = (await axios.post<RobotState>("/robotState", change)).data;
+ };
+diff --git a/photon-core/src/main/java/org/photonvision/vision/processes/IdleMode.java b/photon-core/src/main/java/org/photonvision/vision/processes/IdleMode.java
+index b2ebfa55..75e16b6d 100644
+--- a/photon-core/src/main/java/org/photonvision/vision/processes/IdleMode.java
++++ b/photon-core/src/main/java/org/photonvision/vision/processes/IdleMode.java
+@@ -50,6 +50,9 @@ public final class IdleMode {
+     public static class Settings {
+         public boolean idleWhileDisabled = true;
+         public double idleFps = readFps();
++        /** photonvision-51: switch every camera to eventPipeline when the FMS connects. */
++        public boolean eventProfileOnFms = false;
++        public int eventPipeline = 0;
+     }
+ 
+     private static final Path SETTINGS_FILE = Path.of("/opt/photonvision/spectrum-robot-state.json");
+@@ -87,10 +90,13 @@ public final class IdleMode {
+     }
+ 
+     /** Changes and saves the settings; null leaves a field as it is. */
+-    public static synchronized Settings update(Boolean idleWhileDisabled, Double idleFps) {
++    public static synchronized Settings update(
++            Boolean idleWhileDisabled, Double idleFps, Boolean eventProfileOnFms, Integer eventPipeline) {
+         var s = new Settings();
+         s.idleWhileDisabled = idleWhileDisabled != null ? idleWhileDisabled : settings.idleWhileDisabled;
+         s.idleFps = idleFps != null ? Math.max(1, Math.min(120, idleFps)) : settings.idleFps;
++        s.eventProfileOnFms = eventProfileOnFms != null ? eventProfileOnFms : settings.eventProfileOnFms;
++        s.eventPipeline = eventPipeline != null ? Math.max(0, eventPipeline) : settings.eventPipeline;
+         settings = s;
+         periodNanos = period(s);
+         try {
+@@ -102,6 +108,10 @@ public final class IdleMode {
+                 s.idleWhileDisabled
+                         ? "Idle mode on: " + s.idleFps + " fps per camera while the robot is disabled"
+                         : "Idle mode off: full speed while the robot is disabled");
++        logger.info(
++                s.eventProfileOnFms
++                        ? "Event profile: every camera to pipeline " + s.eventPipeline + " when the FMS connects"
++                        : "Event profile off");
+         return s;
+     }
+ 
+@@ -151,6 +161,9 @@ public final class IdleMode {
+         m.put("autonomous", connected && word != null && word.m_autonomous());
+         m.put("fmsAttached", connected && word != null && word.m_fmsAttached());
+         m.put("idleNow", active());
++        m.put("eventProfileOnFms", settings.eventProfileOnFms);
++        m.put("eventPipeline", settings.eventPipeline);
++        m.put("lastEventSwitch", lastEventSwitch);
+         return m;
+     }
+ 
+@@ -165,6 +178,11 @@ public final class IdleMode {
+                         : "Idle mode off: full speed while the robot is disabled");
+         ds.addTransitionListener(
+                 (old, now) -> {
++                    // photonvision-51: once, as the FMS connects; anything after that (the
++                    // dashboard, robot code) is left alone.
++                    if (!old.m_fmsAttached() && now.m_fmsAttached() && settings.eventProfileOnFms) {
++                        switchAllTo(settings.eventPipeline, "the field (FMS) connected");
++                    }
+                     if (old.m_enabled() && !now.m_enabled()) {
+                         var gc =
+                                 new Thread(
+@@ -183,6 +201,55 @@ public final class IdleMode {
+                 });
+     }
+ 
++    private static volatile String lastEventSwitch = "";
++
++    /**
++     * photonvision-51: every camera that has pipeline {@code index} to it, skipping cameras in
++     * driver mode, calibrating or focusing (as the dashboard's Switch all does). Returns and
++     * remembers a one-line summary.
++     */
++    public static synchronized String switchAllTo(int index, String why) {
++        var switched = new java.util.ArrayList<String>();
++        var skipped = new java.util.ArrayList<String>();
++        // The name most cameras have at this number; a camera with another name there is named
++        // in the summary, as Switch all on the dashboard does (a profile at mismatched numbers).
++        var nameCounts = new java.util.HashMap<String, Integer>();
++        for (var module : VisionSourceManager.getInstance().vmm.getModules()) {
++            var names = module.pipelineManager.getPipelineNicknames();
++            if (names.size() > index) nameCounts.merge(names.get(index), 1, Integer::sum);
++        }
++        String usual =
++                nameCounts.entrySet().stream().max(java.util.Map.Entry.comparingByValue()).map(java.util.Map.Entry::getKey).orElse("");
++        for (var module : VisionSourceManager.getInstance().vmm.getModules()) {
++            String name = module.visionSource.getSettables().getConfiguration().nickname;
++            int current = module.pipelineManager.getRequestedIndex();
++            if (current == -1) skipped.add(name + " (driver mode)");
++            else if (current < -1) skipped.add(name + " (calibrating or focusing)");
++            else if (module.pipelineManager.getPipelineNicknames().size() <= index)
++                skipped.add(name + " (no pipeline " + index + ")");
++            else {
++                if (current != index) {
++                    module.setPipeline(index);
++                    module.saveAndBroadcastAll();
++                }
++                String theirs = module.pipelineManager.getPipelineNicknames().get(index);
++                switched.add(theirs.equals(usual) ? name : name + " (its " + index + " is '" + theirs + "')");
++            }
++        }
++        String summary =
++                java.time.LocalTime.now().withNano(0)
++                        + ": "
++                        + why
++                        + ", pipeline "
++                        + index
++                        + ": "
++                        + (switched.isEmpty() ? "no camera switched" : "switched " + String.join(", ", switched))
++                        + (skipped.isEmpty() ? "" : "; not switched: " + String.join(", ", skipped));
++        lastEventSwitch = summary;
++        logger.info("Event profile: " + summary);
++        return summary;
++    }
++
+     private static void collect() {
+         var mem = ManagementFactory.getMemoryMXBean();
+         long before = mem.getHeapMemoryUsage().getUsed();
+diff --git a/photon-server/src/main/java/org/photonvision/server/RequestHandler.java b/photon-server/src/main/java/org/photonvision/server/RequestHandler.java
+index ba2edadd..28314535 100644
+--- a/photon-server/src/main/java/org/photonvision/server/RequestHandler.java
++++ b/photon-server/src/main/java/org/photonvision/server/RequestHandler.java
+@@ -610,7 +610,12 @@ public class RequestHandler {
+         }
+     }
+ 
+-    private record RobotStateRequest(Boolean idleWhileDisabled, Double idleFps) {}
++    private record RobotStateRequest(
++            Boolean idleWhileDisabled,
++            Double idleFps,
++            Boolean eventProfileOnFms,
++            Integer eventPipeline,
++            Boolean switchNow) {}
+ 
+     /** SpectrumJetson (photonvision-50): idle mode's settings and the robot's state. */
+     public static void onRobotStateRequest(Context ctx) {
+@@ -625,11 +630,15 @@ public class RequestHandler {
+     public static void onRobotStateSetRequest(Context ctx) {
+         try {
+             var req = kObjectMapper.readValue(ctx.body(), RobotStateRequest.class);
+-            IdleMode.update(req.idleWhileDisabled(), req.idleFps());
++            IdleMode.update(req.idleWhileDisabled(), req.idleFps(), req.eventProfileOnFms(), req.eventPipeline());
++            // photonvision-51: "Switch now" on Settings > Robot state, to test the event profile.
++            if (Boolean.TRUE.equals(req.switchNow())) {
++                IdleMode.switchAllTo(IdleMode.getSettings().eventPipeline, "Switch now (Settings)");
++            }
+             onRobotStateRequest(ctx);
+         } catch (IOException e) {
+             ctx.status(400);
+-            ctx.result("Expected {idleWhileDisabled, idleFps}");
++            ctx.result("Expected {idleWhileDisabled, idleFps, eventProfileOnFms, eventPipeline, switchNow}");
+         }
+     }
+ 

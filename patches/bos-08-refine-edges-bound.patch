@@ -1,0 +1,37 @@
+--- a/third_party/971apriltag/apriltag_detect.cc
++++ b/third_party/971apriltag/apriltag_detect.cc
+@@ -1,3 +1,4 @@
++#include <cmath>
+ #include <thrust/iterator/constant_iterator.h>
+ #include <thrust/iterator/transform_iterator.h>
+ 
+@@ -442,6 +443,10 @@
+     // our original line that have large gradients. On really big tags,
+     // we're willing to sample more to get an even better estimate.
+     int nsamples = std::max<int>(16, mag / 8);  // XXX tunable
++    // SpectrumJetson (bos-08): never more samples than the image is big. A candidate quad with a
++    // corner far outside the image (seen on full-size searches of busy scenes) made this hundreds
++    // of millions, and one frame's detection ran for minutes.
++    nsamples = std::min<int>(nsamples, std::max<int>(16, (im_orig->width + im_orig->height) / 8));
+ 
+     // stats for fitting a line...
+     double Mx = 0, My = 0, Mxx = 0, Mxy = 0, Myy = 0, N = 0;
+@@ -593,6 +598,18 @@
+     quad_original.H = nullptr;
+     quad_original.Hinv = nullptr;
+ 
++    // SpectrumJetson (bos-08): a quad with a corner that isn't a number or is far outside the image
++    // can't be a tag; skip it before RefineEdges spends its samples on it.
++    {
++      bool sane = true;
++      const float w = static_cast<float>(im->width), h = static_cast<float>(im->height);
++      for (int k = 0; k < 4 && sane; ++k) {
++        const float x = quad_original.p[k][0], y = quad_original.p[k][1];
++        sane = std::isfinite(x) && std::isfinite(y) && x > -w && x < 2 * w && y > -h && y < 2 * h;
++      }
++      if (!sane) continue;
++    }
++
+     if (td->refine_edges) {
+       RefineEdges(td, im, &quad_original, task->camera_matrix,
+                   task->distortion_coefficients);

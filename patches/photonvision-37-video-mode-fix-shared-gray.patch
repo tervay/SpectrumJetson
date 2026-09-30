@@ -1,0 +1,136 @@
+--- a/photon-core/src/main/java/org/photonvision/vision/pipe/impl/GrayscalePipe.java
++++ b/photon-core/src/main/java/org/photonvision/vision/pipe/impl/GrayscalePipe.java
+@@ -26,8 +26,11 @@
+     protected Mat process(Mat in) {
+         var outputMat = new Mat();
+         if (in.channels() == 1) {
+-            // SpectrumJetson: already gray (kGray capture sink); just copy.
+-            in.copyTo(outputMat);
++            // SpectrumJetson: already gray (the direct gray decode). Share the pixels instead of
++            // copying 1 MB a frame (photonvision-37): OpenCV counts the references, so either Mat
++            // can be released first. Only the dashboard stream draws on a frame, and it gets its
++            // own copy first (Frame.unshareProcessed).
++            in.assignTo(outputMat);
+             return outputMat;
+         }
+         // We can save a copy here by sending the output of cvtcolor to outputMat directly
+--- a/photon-core/src/main/java/org/photonvision/vision/frame/Frame.java
++++ b/photon-core/src/main/java/org/photonvision/vision/frame/Frame.java
+@@ -79,6 +79,22 @@
+                 new FrameStaticProperties(0, 0, 0, null));
+     }
+ 
++    /**
++     * SpectrumJetson (photonvision-37): GrayscalePipe shares a gray frame's pixels between
++     * colorImage and processedImage. Before anything draws on either (the stream thread draws on
++     * both), give processedImage its own copy.
++     */
++    public void unshareProcessed() {
++        var in = colorImage.getMat();
++        var out = processedImage.getMat();
++        if (in == null || out == null || in.empty() || out.empty() || in.dataAddr() != out.dataAddr()) {
++            return;
++        }
++        var copy = out.clone();
++        copy.assignTo(out);
++        copy.release();
++    }
++
+     public void copyTo(Frame destFrame) {
+         colorImage.getMat().copyTo(destFrame.colorImage.getMat());
+         processedImage.getMat().copyTo(destFrame.processedImage.getMat());
+--- a/photon-core/src/main/java/org/photonvision/vision/processes/VisionModule.java
++++ b/photon-core/src/main/java/org/photonvision/vision/processes/VisionModule.java
+@@ -958,6 +958,7 @@
+                 && (pipelineManager.getCurrentPipelineSettings()
+                         instanceof AdvancedPipelineSettings settings)) {
+             if (streamFrameWanted()) {
++                result.inputAndOutputFrame.unshareProcessed(); // the stream draws on both images
+                 streamRunnable.updateData(result.inputAndOutputFrame, settings, result.targets);
+                 // The streamRunnable manages releasing in this case
+             } else {
+--- a/photon-core/src/main/java/org/photonvision/vision/pipeline/ArucoPipeline.java
++++ b/photon-core/src/main/java/org/photonvision/vision/pipeline/ArucoPipeline.java
+@@ -139,6 +139,7 @@
+ 
+         // If we want to debug the thresholding steps, draw the first step to the color image
+         if (settings.debugThreshold) {
++            frame.unshareProcessed(); // draws into colorImage (photonvision-37)
+             drawThresholdFrame(
+                     frame.processedImage.getMat(),
+                     frame.colorImage.getMat(),
+--- a/photon-core/src/main/java/org/photonvision/vision/frame/provider/USBFrameProvider.java
++++ b/photon-core/src/main/java/org/photonvision/vision/frame/provider/USBFrameProvider.java
+@@ -20,6 +20,7 @@
+ import edu.wpi.first.cameraserver.CameraServer;
+ import edu.wpi.first.cscore.CvSink;
+ import edu.wpi.first.cscore.UsbCamera;
++import edu.wpi.first.cscore.VideoMode;
+ import edu.wpi.first.cscore.VideoSource;
+ import org.photonvision.rewind.RewindRecorder;
+ import edu.wpi.first.util.PixelFormat;
+@@ -417,16 +418,45 @@
+      * (UsbCameraImpl::DeviceCmdSetMode returns when the mode is unchanged). Closing and reopening the
+      * camera makes cscore apply its mode to the device again ("restoring video mode" on connect).
+      */
++    /**
++     * SpectrumJetson (photonvision-37): the camera streams another size than cscore's mode. Seen at
++     * ~1 in 10 starts with 4 cameras: cscore opens the camera at its lowest mode (320x240), then
++     * PhotonVision's 1280x800 makes it reopen the device, and VIDIOC_S_FMT fails with EBUSY (the
++     * previous handle not yet released). cscore keeps 1280x800 as its mode anyway. A reconnect
++     * (kForceClose) doesn't fix it: cscore's Linux camera only stops streaming then, it doesn't
++     * reopen the device or set the format again, and setting the same mode is a no-op. Switching
++     * to another mode and back makes two real changes, each reopening the device and setting its
++     * format.
++     */
+     private void reconnectForVideoMode(int width, int height, int attempt) {
+-        reconnectCamera(
++        String why =
+                 "The camera is sending frames that aren't "
+                         + width
+                         + "x"
+                         + height
+-                        + ", the video mode PhotonVision set; reconnecting it so the mode is applied again"
+-                        + " (attempt "
++                        + ", the video mode PhotonVision set; applying the mode again (attempt "
+                         + attempt
+-                        + ")");
++                        + ")";
++        VideoMode want = camera.getVideoMode();
++        VideoMode other = null;
++        try {
++            for (VideoMode m : camera.enumerateVideoModes()) {
++                if (m.pixelFormat == want.pixelFormat && (m.width != want.width || m.height != want.height)) {
++                    other = m;
++                    break;
++                }
++            }
++        } catch (Exception e) {
++            other = null;
++        }
++        if (other == null) {
++            reconnectCamera(why + " (no other mode to switch through; reconnecting)");
++            return;
++        }
++        logger.warn(why + ": switching through " + other.width + "x" + other.height);
++        stuckWatchdog.noteReconnect();
++        camera.setVideoMode(other);
++        camera.setVideoMode(want);
+     }
+ 
+     /**
+--- a/photon-core/src/main/java/org/photonvision/vision/camera/USBCameras/GenericUSBCameraSettables.java
++++ b/photon-core/src/main/java/org/photonvision/vision/camera/USBCameras/GenericUSBCameraSettables.java
+@@ -295,7 +295,11 @@
+                 logger.error("Got a null video mode! Doing nothing...");
+                 return;
+             }
+-            if (camera.setVideoMode(videoMode)) logger.debug("Failed to set video mode!");
++            // SpectrumJetson (photonvision-37): setVideoMode returns true on success; this logged
++            // "Failed" on every successful set. cscore also returns true when the device refused
++            // the format (it logs "could not set format"); USBFrameProvider catches that from the
++            // frame size.
++            if (!camera.setVideoMode(videoMode)) logger.warn("Failed to set video mode!");
+         } catch (Exception e) {
+             logger.error("Failed to set video mode!", e);
+         }

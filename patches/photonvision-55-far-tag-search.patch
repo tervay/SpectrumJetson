@@ -1,0 +1,221 @@
+diff --git a/photon-client/src/components/settings/RobotStateCard.vue b/photon-client/src/components/settings/RobotStateCard.vue
+index 762b775b..368e72f0 100644
+--- a/photon-client/src/components/settings/RobotStateCard.vue
++++ b/photon-client/src/components/settings/RobotStateCard.vue
+@@ -92,6 +92,36 @@ onBeforeUnmount(() => clearInterval(timer));
+         @update:model-value="(v) => set({ idleFps: v })"
+       />
+       <v-divider class="my-3" />
++      <pv-switch
++        :model-value="robotState.farSearch"
++        :disabled="busy"
++        label="Far-tag search when the pose is weak"
++        tooltip="Tags are normally searched for on a half-size image, which misses tags under ~20 px (far away). When no camera sees two good near tags for 0.25 s, one camera at a time also searches its full-size image (and follows far tags it finds with small full-size crops): about 1.7x the range. It stops as soon as any camera has a good view again, so it costs nothing while the pose is good."
++        :label-cols="4"
++        @update:model-value="(v) => set({ farSearch: !!v })"
++      />
++      <pv-slider
++        :model-value="robotState.farSweepsPerSecond"
++        :disabled="busy || !robotState.farSearch"
++        label="Full-size searches a second"
++        tooltip="Across all cameras, while searching. Each takes ~5 ms of GPU; 30 a second is ~16%."
++        :min="5"
++        :max="60"
++        :step="5"
++        :slider-cols="8"
++        @update:model-value="(v) => set({ farSweepsPerSecond: v })"
++      />
++      <p class="text-caption pb-1" data-testid="far-search-status">
++        <template v-if="!robotState.farSearch">Off: tags are only searched for on the half-size image.</template>
++        <template v-else-if="robotState.farSearchSweeps === undefined">Status unknown (older detector library).</template>
++        <template v-else>
++          {{ robotState.farSearchStarved ? "Searching now: no camera has a good view." : "Waiting: a camera has a good view." }}
++          Since start: {{ robotState.farSearchStarvedSeconds?.toFixed(0) }} s searching,
++          {{ robotState.farSearchSweeps }} full-size searches ({{ robotState.farSearchSweepMs?.toFixed(1) }} ms each),
++          {{ robotState.farSearchTags }} far tags found.
++        </template>
++      </p>
++      <v-divider class="my-3" />
+       <pv-switch
+         :model-value="robotState.eventProfileOnFms"
+         :disabled="busy"
+diff --git a/photon-client/src/lib/RobotState.ts b/photon-client/src/lib/RobotState.ts
+index 1b45a028..b76b7245 100644
+--- a/photon-client/src/lib/RobotState.ts
++++ b/photon-client/src/lib/RobotState.ts
+@@ -15,6 +15,15 @@ export interface RobotState {
+   eventProfileOnFms: boolean;
+   eventPipeline: number;
+   lastEventSwitch: string;
++  // photonvision-55
++  farSearch: boolean;
++  farSweepsPerSecond: number;
++  farSearchStarved?: boolean;
++  farSearchSweeps?: number;
++  farSearchCrops?: number;
++  farSearchTags?: number;
++  farSearchStarvedSeconds?: number;
++  farSearchSweepMs?: number;
+ }
+ 
+ export interface RobotStateChange {
+@@ -23,6 +32,8 @@ export interface RobotStateChange {
+   eventProfileOnFms?: boolean;
+   eventPipeline?: number;
+   switchNow?: boolean;
++  farSearch?: boolean;
++  farSweepsPerSecond?: number;
+ }
+ 
+ export const robotState = ref<RobotState | null>(null);
+diff --git a/photon-core/src/main/java/org/photonvision/vision/objects/GpuDetectorJNI.java b/photon-core/src/main/java/org/photonvision/vision/objects/GpuDetectorJNI.java
+index 77f8d6ea..42609ed5 100644
+--- a/photon-core/src/main/java/org/photonvision/vision/objects/GpuDetectorJNI.java
++++ b/photon-core/src/main/java/org/photonvision/vision/objects/GpuDetectorJNI.java
+@@ -54,4 +54,17 @@ public class GpuDetectorJNI {
+ 		    double fy, double cy, double k1, double k2, double p1,
+ 		    double p2, double k3, double k4, double k5, double k6);
+ 
++
++    /**
++     * SpectrumJetson (photonvision-55): the far-tag search (detector/far_search.h): full-size
++     * searches, one camera at a time, only while no camera has a good view. {@code sweepsPerSecond}
++     * caps the full-size searches across all cameras.
++     */
++    public static native void setFarSearch(boolean enabled, double sweepsPerSecond);
++
++    /**
++     * {enabled, starved now, full-size searches, crops, far tags returned, seconds starved, ms in
++     * full-size searches, ms in crops}, since PhotonVision started.
++     */
++    public static native double[] farSearchStatus();
+ }
+diff --git a/photon-core/src/main/java/org/photonvision/vision/processes/IdleMode.java b/photon-core/src/main/java/org/photonvision/vision/processes/IdleMode.java
+index d170675b..b87fb3cf 100644
+--- a/photon-core/src/main/java/org/photonvision/vision/processes/IdleMode.java
++++ b/photon-core/src/main/java/org/photonvision/vision/processes/IdleMode.java
+@@ -53,6 +53,9 @@ public final class IdleMode {
+         /** photonvision-51: switch every camera to eventPipeline when the FMS connects. */
+         public boolean eventProfileOnFms = false;
+         public int eventPipeline = 0;
++        /** photonvision-55: full-size searches for far tags while no camera has a good view. */
++        public boolean farSearch = true;
++        public double farSweepsPerSecond = 30;
+     }
+ 
+     private static final Path SETTINGS_FILE = Path.of("/opt/photonvision/spectrum-robot-state.json");
+@@ -92,13 +95,29 @@ public final class IdleMode {
+     /** Changes and saves the settings; null leaves a field as it is. */
+     public static synchronized Settings update(
+             Boolean idleWhileDisabled, Double idleFps, Boolean eventProfileOnFms, Integer eventPipeline) {
++        return update(idleWhileDisabled, idleFps, eventProfileOnFms, eventPipeline, null, null);
++    }
++
++    public static synchronized Settings update(
++            Boolean idleWhileDisabled,
++            Double idleFps,
++            Boolean eventProfileOnFms,
++            Integer eventPipeline,
++            Boolean farSearch,
++            Double farSweepsPerSecond) {
+         var s = new Settings();
+         s.idleWhileDisabled = idleWhileDisabled != null ? idleWhileDisabled : settings.idleWhileDisabled;
+         s.idleFps = idleFps != null ? Math.max(1, Math.min(120, idleFps)) : settings.idleFps;
+         s.eventProfileOnFms = eventProfileOnFms != null ? eventProfileOnFms : settings.eventProfileOnFms;
+         s.eventPipeline = eventPipeline != null ? Math.max(0, eventPipeline) : settings.eventPipeline;
++        s.farSearch = farSearch != null ? farSearch : settings.farSearch;
++        s.farSweepsPerSecond =
++                farSweepsPerSecond != null ? Math.max(1, Math.min(120, farSweepsPerSecond)) : settings.farSweepsPerSecond;
+         settings = s;
+         periodNanos = period(s);
++        farSearchApplied = false;
++        farSearchNextTryMs = 0;
++        applyFarSearch();
+         try {
+             json.writeValue(SETTINGS_FILE.toFile(), s);
+         } catch (IOException e) {
+@@ -116,7 +135,36 @@ public final class IdleMode {
+     }
+ 
+     /** True while frames should be limited: a robot is connected and disabled. */
++    // photonvision-55: hand the far-search settings to the detector library once it's loaded.
++    private static volatile boolean farSearchApplied = false;
++
++    private static volatile long farSearchNextTryMs = 0;
++
++    private static void applyFarSearch() {
++        if (farSearchApplied) return;
++        // At most every 5 s: a missing native method throws, and this runs on every frame.
++        long now = System.currentTimeMillis();
++        if (now < farSearchNextTryMs) return;
++        farSearchNextTryMs = now + 5000;
++        try {
++            org.photonvision.jni.GpuDetectorJNI.setFarSearch(settings.farSearch, settings.farSweepsPerSecond);
++            farSearchApplied = true;
++        } catch (UnsatisfiedLinkError | NoClassDefFoundError e) {
++            // Library not loaded yet (or an older one without the far search): try again later.
++        }
++    }
++
++    /** The far search's counters, or null without a detector library that has it. */
++    public static double[] farSearchStatus() {
++        try {
++            return org.photonvision.jni.GpuDetectorJNI.farSearchStatus();
++        } catch (UnsatisfiedLinkError | NoClassDefFoundError e) {
++            return null;
++        }
++    }
++
+     public static boolean active() {
++        if (!farSearchApplied) applyFarSearch();
+         if (!listening) startListening(); // the GC on disable runs with idle off too
+         if (periodNanos == 0) return false;
+         var ntm = NetworkTablesManager.getInstance();
+@@ -164,6 +212,17 @@ public final class IdleMode {
+         m.put("eventProfileOnFms", settings.eventProfileOnFms);
+         m.put("eventPipeline", settings.eventPipeline);
+         m.put("lastEventSwitch", lastEventSwitch);
++        m.put("farSearch", settings.farSearch);
++        m.put("farSweepsPerSecond", settings.farSweepsPerSecond);
++        var far = farSearchStatus();
++        if (far != null && far.length >= 8) {
++            m.put("farSearchStarved", far[1] > 0);
++            m.put("farSearchSweeps", (long) far[2]);
++            m.put("farSearchCrops", (long) far[3]);
++            m.put("farSearchTags", (long) far[4]);
++            m.put("farSearchStarvedSeconds", far[5]);
++            m.put("farSearchSweepMs", far[2] > 0 ? far[6] / far[2] : 0);
++        }
+         return m;
+     }
+ 
+diff --git a/photon-server/src/main/java/org/photonvision/server/RequestHandler.java b/photon-server/src/main/java/org/photonvision/server/RequestHandler.java
+index 51ca60c0..f205110b 100644
+--- a/photon-server/src/main/java/org/photonvision/server/RequestHandler.java
++++ b/photon-server/src/main/java/org/photonvision/server/RequestHandler.java
+@@ -616,7 +616,9 @@ public class RequestHandler {
+             Double idleFps,
+             Boolean eventProfileOnFms,
+             Integer eventPipeline,
+-            Boolean switchNow) {}
++            Boolean switchNow,
++            Boolean farSearch,
++            Double farSweepsPerSecond) {}
+ 
+     /** SpectrumJetson (photonvision-50): idle mode's settings and the robot's state. */
+     public static void onRobotStateRequest(Context ctx) {
+@@ -631,7 +633,13 @@ public class RequestHandler {
+     public static void onRobotStateSetRequest(Context ctx) {
+         try {
+             var req = kObjectMapper.readValue(ctx.body(), RobotStateRequest.class);
+-            IdleMode.update(req.idleWhileDisabled(), req.idleFps(), req.eventProfileOnFms(), req.eventPipeline());
++            IdleMode.update(
++                    req.idleWhileDisabled(),
++                    req.idleFps(),
++                    req.eventProfileOnFms(),
++                    req.eventPipeline(),
++                    req.farSearch(),
++                    req.farSweepsPerSecond());
+             // photonvision-51: "Switch now" on Settings > Robot state, to test the event profile.
+             if (Boolean.TRUE.equals(req.switchNow())) {
+                 IdleMode.switchAllTo(IdleMode.getSettings().eventPipeline, "Switch now (Settings)");

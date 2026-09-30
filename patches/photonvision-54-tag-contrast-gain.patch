@@ -1,0 +1,622 @@
+diff --git a/photon-client/src/components/dashboard/tabs/InputTab.vue b/photon-client/src/components/dashboard/tabs/InputTab.vue
+index df0b42d1..e762c48c 100644
+--- a/photon-client/src/components/dashboard/tabs/InputTab.vue
++++ b/photon-client/src/components/dashboard/tabs/InputTab.vue
+@@ -1,4 +1,6 @@
+ <script setup lang="ts">
++import { onBeforeUnmount as onBeforeUnmountTc, onMounted as onMountedTc } from "vue";
++import { describeTagContrast, loadTagContrast, tagContrast } from "@/lib/TagContrast";
+ import PvSlider from "@/components/common/pv-slider.vue";
+ import { useCameraSettingsStore } from "@/stores/settings/CameraSettingsStore";
+ import PvSwitch from "@/components/common/pv-switch.vue";
+@@ -108,6 +110,14 @@ const setExtraControl = (c: ExtraCameraControl, value: number | boolean) =>
+ 
+ const { mdAndDown } = useDisplay();
+ 
++// SpectrumJetson (photonvision-54): how this camera's tags look, next to the controls that change it.
++let tagContrastTimer: ReturnType<typeof setInterval> | undefined;
++onMountedTc(() => {
++  loadTagContrast();
++  tagContrastTimer = setInterval(loadTagContrast, 1000);
++});
++onBeforeUnmountTc(() => clearInterval(tagContrastTimer));
++
+ const interactiveCols = computed(() =>
+   mdAndDown.value && (!useStateStore().sidebarFolded || useCameraSettingsStore().isDriverMode) ? 8 : 7
+ );
+@@ -116,6 +126,25 @@ const interactiveCols = computed(() =>
+ <template>
+   <div>
+     <tuning-guide />
++    <v-alert
++      data-testid="tag-contrast"
++      density="compact"
++      variant="tonal"
++      class="mb-2"
++      :type="
++        tagContrast[useCameraSettingsStore().currentCameraSettings.nickname]?.verdict === 'good'
++          ? 'success'
++          : tagContrast[useCameraSettingsStore().currentCameraSettings.nickname]?.verdict === 'no tags' ||
++              !tagContrast[useCameraSettingsStore().currentCameraSettings.nickname]
++            ? 'info'
++            : 'warning'
++      "
++    >
++      Tags: {{ describeTagContrast(tagContrast[useCameraSettingsStore().currentCameraSettings.nickname]) }}
++      <div v-if="tagContrast[useCameraSettingsStore().currentCameraSettings.nickname]?.advice" class="text-caption">
++        {{ tagContrast[useCameraSettingsStore().currentCameraSettings.nickname].advice }}
++      </div>
++    </v-alert>
+     <pv-switch
+       v-model="useCameraSettingsStore().currentPipelineSettings.cameraAutoExposure"
+       label="Auto Exposure"
+diff --git a/photon-client/src/lib/TagContrast.ts b/photon-client/src/lib/TagContrast.ts
+new file mode 100644
+index 00000000..4f59b86e
+--- /dev/null
++++ b/photon-client/src/lib/TagContrast.ts
+@@ -0,0 +1,29 @@
++// SpectrumJetson (photonvision-54): /api/tagContrast, how each camera's tags look (their white margin
++// and black border): shared by the Input tab and the Match Ready page.
++import axios from "axios";
++import { ref } from "vue";
++
++export interface TagContrast {
++  verdict: "good" | "whites clipping" | "low contrast" | "blacks lifted" | "no tags";
++  advice: string;
++  white?: number;
++  black?: number;
++  contrast?: number;
++  clipped?: number;
++  tags?: number;
++}
++
++export const tagContrast = ref<Record<string, TagContrast>>({});
++
++export const loadTagContrast = async () => {
++  try {
++    tagContrast.value = (await axios.get<Record<string, TagContrast>>("/tagContrast")).data;
++  } catch {
++    tagContrast.value = {};
++  }
++};
++
++export const describeTagContrast = (t?: TagContrast): string => {
++  if (!t || t.verdict === "no tags") return "no tag close enough to measure";
++  return `white ${t.white}, black ${t.black} (contrast ${t.contrast}), ${t.clipped}% clipped: ${t.verdict}`;
++};
+diff --git a/photon-client/src/views/ReadyView.vue b/photon-client/src/views/ReadyView.vue
+index 52947214..dc88c57c 100644
+--- a/photon-client/src/views/ReadyView.vue
++++ b/photon-client/src/views/ReadyView.vue
+@@ -9,6 +9,7 @@ import { useStateStore } from "@/stores/StateStore";
+ import { resolutionsAreEqual } from "@/lib/PhotonUtils";
+ import { PipelineType } from "@/types/PipelineTypes";
+ import { loadRobotState, robotState } from "@/lib/RobotState";
++import { loadTagContrast, tagContrast } from "@/lib/TagContrast";
+ 
+ interface CheckItem {
+   level: "PASS" | "WARN" | "FAIL" | "INFO";
+@@ -47,7 +48,11 @@ onMounted(() => {
+   runChecks();
+   checkTimer = setInterval(runChecks, 30_000);
+   loadRobotState();
+-  robotTimer = setInterval(loadRobotState, 2000);
++  loadTagContrast();
++  robotTimer = setInterval(() => {
++    loadRobotState();
++    loadTagContrast();
++  }, 2000);
+ });
+ onBeforeUnmount(() => {
+   clearInterval(checkTimer);
+@@ -112,6 +117,9 @@ const tiles = computed<Tile[]>(() =>
+     else if (targetFps && fps < targetFps * 0.8 && !robotState.value?.idleNow) problems.push(`${Math.round(fps)} fps`);
+     if (calibrated === false) problems.push(`not calibrated at ${format?.resolution.width}x${format?.resolution.height}`);
+     if (driverMode) problems.push("driver mode");
++    // photonvision-54: how its tags look, when one is close enough to measure.
++    const tc = tagContrast.value[c.nickname];
++    if (tc && tc.verdict !== "good" && tc.verdict !== "no tags") problems.push(`tags: ${tc.verdict}`);
+     return {
+       id,
+       name: c.nickname,
+@@ -199,6 +207,10 @@ const openSections = ref<number[]>([]);
+                 >, {{ t.calibrated ? "calibrated" : "not calibrated" }}</span
+               >
+             </div>
++            <div v-if="tagContrast[t.name] && tagContrast[t.name].verdict !== 'no tags'" class="text-caption">
++              Tag contrast {{ tagContrast[t.name].contrast }} (white {{ tagContrast[t.name].white }}, black
++              {{ tagContrast[t.name].black }}, {{ tagContrast[t.name].clipped }}% clipped)
++            </div>
+             <div v-if="t.problems.length" class="text-warning pt-1">{{ t.problems.join(", ") }}</div>
+           </v-card-text>
+         </v-card>
+diff --git a/photon-core/src/main/java/org/photonvision/vision/camera/USBCameras/GenericUSBCameraSettables.java b/photon-core/src/main/java/org/photonvision/vision/camera/USBCameras/GenericUSBCameraSettables.java
+index 4667451e..4e4102df 100644
+--- a/photon-core/src/main/java/org/photonvision/vision/camera/USBCameras/GenericUSBCameraSettables.java
++++ b/photon-core/src/main/java/org/photonvision/vision/camera/USBCameras/GenericUSBCameraSettables.java
+@@ -485,6 +485,18 @@ public class GenericUSBCameraSettables extends VisionSourceSettables {
+      * @param options
+      * @return
+      */
++    /**
++     * SpectrumJetson (photonvision-54): the quirks list says the Thrifty OV9281 (1bcf:28c5) has gain
++     * (upstream #2478), but ours reports no gain control, so the Camera Gain slider did nothing.
++     * Asks the camera, once it's connected (cscore lists its controls only then).
++     */
++    @Override
++    public boolean hasControl(String name) {
++        if (!camera.isConnected()) return true;
++        return camera.getProperty(name).getKind() != VideoProperty.Kind.kNone
++                || camera.getProperty("raw_" + name).getKind() != VideoProperty.Kind.kNone;
++    }
++
+     protected Optional<VideoProperty> findProperty(String... options) {
+         VideoProperty retProp = null;
+         boolean found = false;
+diff --git a/photon-core/src/main/java/org/photonvision/vision/pipeline/AprilTagCudaPipeline.java b/photon-core/src/main/java/org/photonvision/vision/pipeline/AprilTagCudaPipeline.java
+index a3a9862d..f38a9724 100644
+--- a/photon-core/src/main/java/org/photonvision/vision/pipeline/AprilTagCudaPipeline.java
++++ b/photon-core/src/main/java/org/photonvision/vision/pipeline/AprilTagCudaPipeline.java
+@@ -50,6 +50,7 @@ import org.photonvision.vision.pipe.impl.MultiTargetPNPPipe;
+ import org.photonvision.vision.pipe.impl.MultiTargetPNPPipe.MultiTargetPNPPipeParams;
+ import org.photonvision.vision.pipeline.result.CVPipelineResult;
+ import org.photonvision.vision.target.ExcludedTags;
++import org.photonvision.vision.target.TagContrast;
+ import org.photonvision.vision.target.TrackedTarget;
+ import org.photonvision.vision.target.TrackedTarget.TargetCalculationParameters;
+ 
+@@ -119,6 +120,8 @@ public class AprilTagCudaPipeline extends CVPipeline<CVPipelineResult, AprilTagC
+         }
+     }
+ 
++    private long lastContrastNanos = 0;
++
+     @Override
+     protected CVPipelineResult process(Frame frame, AprilTagCudaPipelineSettings settings) {
+         long sumPipeNanosElapsed = 0L;
+@@ -157,6 +160,11 @@ public class AprilTagCudaPipeline extends CVPipeline<CVPipelineResult, AprilTagC
+             targetList.add(target);
+         }
+ 
++        // SpectrumJetson (photonvision-54): the tags' white margin and black border, a few times a
++        // second, so a bad exposure or brightness shows as a reason (TagContrast).
++        var contrast = TagContrast.measure(frame.processedImage.getMat(), usedDetections, lastContrastNanos);
++        if (contrast != null) lastContrastNanos = contrast.atNanos();
++
+         // Do multi-tag pose estimation
+         Optional<MultiTargetPNPResult> multiTagResult = Optional.empty();
+         if (settings.solvePNPEnabled && settings.doMultiTarget) {
+@@ -246,8 +254,11 @@ public class AprilTagCudaPipeline extends CVPipeline<CVPipelineResult, AprilTagC
+         var fpsResult = calculateFPSPipe.run(null);
+         var fps = fpsResult.output;
+ 
+-        return new CVPipelineResult(
+-                frame.sequenceID, sumPipeNanosElapsed, fps, targetList, multiTagResult, frame);
++        var result =
++                new CVPipelineResult(
++                        frame.sequenceID, sumPipeNanosElapsed, fps, targetList, multiTagResult, frame);
++        result.tagContrast = contrast;
++        return result;
+     }
+ 
+     @Override
+diff --git a/photon-core/src/main/java/org/photonvision/vision/pipeline/result/CVPipelineResult.java b/photon-core/src/main/java/org/photonvision/vision/pipeline/result/CVPipelineResult.java
+index 51773c9f..96992af2 100644
+--- a/photon-core/src/main/java/org/photonvision/vision/pipeline/result/CVPipelineResult.java
++++ b/photon-core/src/main/java/org/photonvision/vision/pipeline/result/CVPipelineResult.java
+@@ -35,6 +35,8 @@ public class CVPipelineResult implements Releasable {
+     public final Frame inputAndOutputFrame;
+     public Optional<MultiTargetPNPResult> multiTagResult;
+     public final List<String> objectDetectionClassNames;
++    /** SpectrumJetson (photonvision-54): how the tags look this frame, when it was measured. */
++    public org.photonvision.vision.target.TagContrast.Measurement tagContrast = null;
+ 
+     public CVPipelineResult(
+             long sequenceID,
+diff --git a/photon-core/src/main/java/org/photonvision/vision/processes/VisionModule.java b/photon-core/src/main/java/org/photonvision/vision/processes/VisionModule.java
+index a7014b30..4213dc33 100644
+--- a/photon-core/src/main/java/org/photonvision/vision/processes/VisionModule.java
++++ b/photon-core/src/main/java/org/photonvision/vision/processes/VisionModule.java
+@@ -128,8 +128,9 @@ public class VisionModule {
+             visionSource.getCameraConfiguration().cameraQuirks = QuirkyCamera.DefaultCamera;
+ 
+         // We don't show gain if the config says it's -1. So check here to make sure
+-        // it's non-negative if it _is_ supported
+-        if (cameraQuirks.hasQuirk(CameraQuirk.Gain)) {
++        // it's non-negative if it _is_ supported. (The constructor's visionSource: the field
++        // hasGainControl() reads isn't set yet.)
++        if (cameraQuirks.hasQuirk(CameraQuirk.Gain) && visionSource.getSettables().hasControl("gain")) {
+             pipelineManager.userPipelineSettings.forEach(
+                     it -> {
+                         if (it.cameraGain == -1) it.cameraGain = 75; // Sane default
+@@ -510,7 +511,7 @@ public class VisionModule {
+         settings.tagFamily = data.tagFamily;
+ 
+         // Disable gain if not applicable
+-        if (!cameraQuirks.hasQuirk(CameraQuirk.Gain)) {
++        if (!hasGainControl()) {
+             settings.cameraGain = -1;
+         }
+         if (!cameraQuirks.hasQuirk(CameraQuirk.AwbRedBlueGain)) {
+@@ -772,7 +773,7 @@ public class VisionModule {
+                         logger.error("Unable to set camera auto exposure!");
+                         logger.error(e.toString());
+                     }
+-                    if (cameraQuirks.hasQuirk(CameraQuirk.Gain)) {
++                    if (hasGainControl()) {
+                         // If the gain is disabled for some reason, re-enable it
+                         if (pipelineSettings.cameraGain == -1) pipelineSettings.cameraGain = 75;
+                         settables.setGain(Math.max(0, pipelineSettings.cameraGain));
+@@ -835,8 +836,12 @@ public class VisionModule {
+         return pipelineManager.getRequestedIndex();
+     }
+ 
++    /**
++     * The camera's quirks say it has gain, and (once connected) it really has the control
++     * (photonvision-54: the Thriftiest Cam is listed with gain but has none).
++     */
+     public boolean hasGainControl() {
+-        return cameraQuirks.hasQuirk(CameraQuirk.Gain);
++        return cameraQuirks.hasQuirk(CameraQuirk.Gain) && visionSource.getSettables().hasControl("gain");
+     }
+ 
+     /** Runs on this camera's vision thread, between frames (as pipeline changes do). */
+@@ -1035,6 +1040,10 @@ public class VisionModule {
+     }
+ 
+     private void consumeResult(CVPipelineResult result) {
++        if (result.tagContrast != null) {
++            org.photonvision.vision.target.TagContrast.record(
++                    visionSource.getSettables().getConfiguration().nickname, result.tagContrast);
++        }
+         consumePipelineResult(result);
+ 
+         // Pipelines like DriverMode and Calibrate3dPipeline have null output frames
+diff --git a/photon-core/src/main/java/org/photonvision/vision/processes/VisionSourceSettables.java b/photon-core/src/main/java/org/photonvision/vision/processes/VisionSourceSettables.java
+index 1ded98b8..5142bb3c 100644
+--- a/photon-core/src/main/java/org/photonvision/vision/processes/VisionSourceSettables.java
++++ b/photon-core/src/main/java/org/photonvision/vision/processes/VisionSourceSettables.java
+@@ -79,6 +79,14 @@ public abstract class VisionSourceSettables {
+ 
+     public abstract void setGain(int gain);
+ 
++    /**
++     * SpectrumJetson (photonvision-54): whether the camera has this control. True when it can't
++     * tell (not connected yet, or not a USB camera), so callers keep what the camera's quirks say.
++     */
++    public boolean hasControl(String name) {
++        return true;
++    }
++
+     // Pretty uncommon so instead of abstract this is just a no-op by default
+     // Overridden by cameras with AWB gain support
+     public void setRedGain(int red) {}
+diff --git a/photon-core/src/main/java/org/photonvision/vision/target/TagContrast.java b/photon-core/src/main/java/org/photonvision/vision/target/TagContrast.java
+new file mode 100644
+index 00000000..7f2ecb15
+--- /dev/null
++++ b/photon-core/src/main/java/org/photonvision/vision/target/TagContrast.java
+@@ -0,0 +1,179 @@
++/*
++ * Copyright (C) Photon Vision.
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++
++package org.photonvision.vision.target;
++
++import edu.wpi.first.apriltag.AprilTagDetection;
++import java.util.ArrayDeque;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++import org.opencv.core.Mat;
++import org.opencv.core.MatOfPoint2f;
++import org.opencv.core.Point;
++import org.opencv.imgproc.Imgproc;
++
++/**
++ * SpectrumJetson (photonvision-54): how the tags themselves look, so a bad exposure, brightness or
++ * gamma shows as a reason ("whites clipping", "blacks lifted") and not only as a lower decision
++ * margin. For each detected tag (at least 24 px across), samples two rings through the homography
++ * from its corners: half a cell inside the edge (the tag's black border) and half a cell outside
++ * (its white margin: 36h11 is 8 cells across the black border, with a 1-cell white margin), along
++ * the middle 70% of each side. Reports the median white and black, their difference, and the share
++ * of white samples at 250 or more (clipped). At most 5 measurements a second per camera, over the
++ * last 2 s.
++ */
++public final class TagContrast {
++    private static final int SAMPLES_PER_SIDE = 16;
++    private static final double MIN_SIDE_PX = 24;
++    private static final long MIN_INTERVAL_NS = 200_000_000L;
++    private static final long WINDOW_NS = 2_000_000_000L;
++
++    /** One frame's measurement over all its tags. */
++    public record Measurement(long atNanos, int tags, double white, double black, double clipped) {}
++
++    /** Last few measurements per camera nickname. */
++    private static final Map<String, ArrayDeque<Measurement>> byCamera = new LinkedHashMap<>();
++
++    private TagContrast() {}
++
++    /** Measures, if it's time: returns null otherwise or when no tag is big enough. */
++    public static Measurement measure(Mat gray, List<AprilTagDetection> detections, long lastNanos) {
++        if (detections.isEmpty() || gray == null || gray.empty() || gray.channels() != 1) return null;
++        long now = System.nanoTime();
++        if (now - lastNanos < MIN_INTERVAL_NS) return null;
++        var white = new ArrayList<Double>();
++        var black = new ArrayList<Double>();
++        int tags = 0;
++        for (var d : detections) {
++            double[] c = d.getCorners();
++            double side = 0;
++            for (int i = 0; i < 4; i++) side += Math.hypot(c[2 * ((i + 1) % 4)] - c[2 * i], c[2 * ((i + 1) % 4) + 1] - c[2 * i + 1]);
++            if (side / 4 < MIN_SIDE_PX) continue;
++            var unit = new MatOfPoint2f(new Point(0, 0), new Point(1, 0), new Point(1, 1), new Point(0, 1));
++            var quad = new MatOfPoint2f(new Point(c[0], c[1]), new Point(c[2], c[3]), new Point(c[4], c[5]), new Point(c[6], c[7]));
++            Mat h = Imgproc.getPerspectiveTransform(unit, quad);
++            double cell = 1.0 / 8;
++            // Points along each side of the unit square, half a cell in (black) and out (white).
++            var in = new ArrayList<Point>();
++            var out = new ArrayList<Point>();
++            for (int k = 0; k < SAMPLES_PER_SIDE; k++) {
++                double t = 0.15 + 0.7 * (k + 0.5) / SAMPLES_PER_SIDE;
++                double a = cell / 2;
++                in.add(new Point(t, a));
++                in.add(new Point(1 - a, t));
++                in.add(new Point(t, 1 - a));
++                in.add(new Point(a, t));
++                out.add(new Point(t, -a));
++                out.add(new Point(1 + a, t));
++                out.add(new Point(t, 1 + a));
++                out.add(new Point(-a, t));
++            }
++            sample(gray, h, in, black);
++            sample(gray, h, out, white);
++            h.release();
++            unit.release();
++            quad.release();
++            tags++;
++        }
++        if (tags == 0 || white.isEmpty() || black.isEmpty()) return null;
++        double clipped = white.stream().filter(v -> v >= 250).count() / (double) white.size();
++        return new Measurement(now, tags, median(white), median(black), clipped);
++    }
++
++    private static void sample(Mat gray, Mat h, List<Point> unitPoints, List<Double> into) {
++        var src = new MatOfPoint2f(unitPoints.toArray(new Point[0]));
++        var dst = new MatOfPoint2f();
++        org.opencv.core.Core.perspectiveTransform(src, dst, h);
++        byte[] px = new byte[1];
++        for (Point p : dst.toArray()) {
++            int x = (int) Math.round(p.x), y = (int) Math.round(p.y);
++            if (x < 0 || y < 0 || x >= gray.cols() || y >= gray.rows()) continue;
++            gray.get(y, x, px);
++            into.add((double) (px[0] & 0xff));
++        }
++        src.release();
++        dst.release();
++    }
++
++    private static double median(List<Double> v) {
++        double[] a = v.stream().mapToDouble(Double::doubleValue).toArray();
++        Arrays.sort(a);
++        return a[a.length / 2];
++    }
++
++    public static synchronized void record(String camera, Measurement m) {
++        var q = byCamera.computeIfAbsent(camera, k -> new ArrayDeque<>());
++        q.addLast(m);
++        while (!q.isEmpty() && m.atNanos() - q.peekFirst().atNanos() > WINDOW_NS) q.removeFirst();
++    }
++
++    /**
++     * Per camera: the median over the last 2 s of white, black, contrast, clipped share and tag count,
++     * and a verdict with what to change. "no tags" if none were measured in the last 3 s.
++     */
++    public static synchronized Map<String, Map<String, Object>> summary(List<String> cameras) {
++        var out = new LinkedHashMap<String, Map<String, Object>>();
++        long now = System.nanoTime();
++        for (String camera : cameras) {
++            var m = new LinkedHashMap<String, Object>();
++            var q = byCamera.get(camera);
++            var recent = q == null ? List.<Measurement>of() : q.stream().filter(x -> now - x.atNanos() < 3_000_000_000L).toList();
++            if (recent.isEmpty()) {
++                m.put("verdict", "no tags");
++                m.put("advice", "No tag big enough to measure (24 px or more) in the last 3 s.");
++                out.put(camera, m);
++                continue;
++            }
++            double white = median(recent.stream().map(Measurement::white).toList());
++            double black = median(recent.stream().map(Measurement::black).toList());
++            double clipped = median(recent.stream().map(Measurement::clipped).toList());
++            int tags = recent.get(recent.size() - 1).tags();
++            m.put("white", Math.round(white));
++            m.put("black", Math.round(black));
++            m.put("contrast", Math.round(white - black));
++            m.put("clipped", Math.round(clipped * 100));
++            m.put("tags", tags);
++            String verdict, advice;
++            if (clipped > 0.10) {
++                verdict = "whites clipping";
++                advice =
++                        black > 60
++                                ? "Tag whites are clipping and blacks are lifted: lower brightness first, then shorten exposure."
++                                : "Tag whites are clipping: shorten exposure (or lower brightness or gamma).";
++            } else if (white - black < 50) {
++                verdict = "low contrast";
++                advice =
++                        black > 60
++                                ? "Low contrast with blacks lifted: lower brightness, then lengthen exposure if the whites get too dark."
++                                : "Low contrast: lengthen exposure (watch motion blur), or raise gamma.";
++            } else if (black > 80) {
++                verdict = "blacks lifted";
++                advice = "Tag blacks are grey: brightness is probably too high.";
++            } else {
++                verdict = "good";
++                advice = "";
++            }
++            m.put("verdict", verdict);
++            m.put("advice", advice);
++            out.put(camera, m);
++        }
++        return out;
++    }
++}
+diff --git a/photon-core/src/test/java/org/photonvision/vision/target/TagContrastTest.java b/photon-core/src/test/java/org/photonvision/vision/target/TagContrastTest.java
+new file mode 100644
+index 00000000..7fac48a2
+--- /dev/null
++++ b/photon-core/src/test/java/org/photonvision/vision/target/TagContrastTest.java
+@@ -0,0 +1,101 @@
++/*
++ * Copyright (C) Photon Vision.
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++
++package org.photonvision.vision.target;
++
++import static org.junit.jupiter.api.Assertions.*;
++
++import edu.wpi.first.apriltag.AprilTagDetection;
++import java.util.List;
++import org.junit.jupiter.api.BeforeAll;
++import org.junit.jupiter.api.Test;
++import org.opencv.core.CvType;
++import org.opencv.core.Mat;
++import org.opencv.core.MatOfPoint;
++import org.opencv.core.Point;
++import org.opencv.core.Scalar;
++import org.opencv.imgproc.Imgproc;
++import org.photonvision.common.LoadJNI;
++
++/** SpectrumJetson (photonvision-54): TagContrast on synthetic tags with known pixel values. */
++public class TagContrastTest {
++    @BeforeAll
++    public static void setup() {
++        LoadJNI.loadLibraries();
++    }
++
++    /** A gray image of `margin`, with a filled quad of `black` at the given corners. */
++    private static Mat tag(int margin, int black, Point... corners) {
++        var m = new Mat(480, 640, CvType.CV_8UC1, new Scalar(margin));
++        Imgproc.fillPoly(m, List.of(new MatOfPoint(corners)), new Scalar(black));
++        return m;
++    }
++
++    private static AprilTagDetection detection(Point... c) {
++        double[] corners = new double[8];
++        for (int i = 0; i < 4; i++) {
++            corners[2 * i] = c[i].x;
++            corners[2 * i + 1] = c[i].y;
++        }
++        return new AprilTagDetection("tag36h11", 1, 0, 50f, new double[9], 0, 0, corners);
++    }
++
++    @Test
++    public void goodTag() {
++        Point[] q = {new Point(200, 140), new Point(360, 140), new Point(360, 300), new Point(200, 300)};
++        var m = TagContrast.measure(tag(200, 30, q), List.of(detection(q)), 0);
++        assertNotNull(m);
++        assertEquals(1, m.tags());
++        assertEquals(200, m.white(), 1);
++        assertEquals(30, m.black(), 1);
++        assertEquals(0, m.clipped(), 1e-9);
++    }
++
++    @Test
++    public void tiltedTagClipped() {
++        // A tag at an angle, its margin blown out to 255.
++        Point[] q = {new Point(180, 150), new Point(380, 120), new Point(400, 330), new Point(170, 310)};
++        var m = TagContrast.measure(tag(255, 60, q), List.of(detection(q)), 0);
++        assertNotNull(m);
++        assertEquals(255, m.white(), 1);
++        assertEquals(60, m.black(), 1);
++        assertEquals(1.0, m.clipped(), 1e-9);
++    }
++
++    @Test
++    public void smallTagsAndRateLimit() {
++        Point[] small = {new Point(300, 200), new Point(320, 200), new Point(320, 220), new Point(300, 220)};
++        assertNull(TagContrast.measure(tag(200, 30, small), List.of(detection(small)), 0), "under 24 px");
++        Point[] q = {new Point(200, 140), new Point(360, 140), new Point(360, 300), new Point(200, 300)};
++        assertNull(TagContrast.measure(tag(200, 30, q), List.of(detection(q)), System.nanoTime()), "too soon");
++    }
++
++    @Test
++    public void verdicts() {
++        long now = System.nanoTime();
++        TagContrast.record("clipping", new TagContrast.Measurement(now, 1, 255, 70, 0.4));
++        TagContrast.record("dim", new TagContrast.Measurement(now, 1, 90, 60, 0));
++        TagContrast.record("fine", new TagContrast.Measurement(now, 2, 190, 35, 0));
++        var s = TagContrast.summary(List.of("clipping", "dim", "fine", "none"));
++        assertEquals("whites clipping", s.get("clipping").get("verdict"));
++        assertTrue(((String) s.get("clipping").get("advice")).contains("lower brightness first"));
++        assertEquals("low contrast", s.get("dim").get("verdict"));
++        assertEquals("good", s.get("fine").get("verdict"));
++        assertEquals(155L, s.get("fine").get("contrast"));
++        assertEquals("no tags", s.get("none").get("verdict"));
++    }
++}
+diff --git a/photon-server/src/main/java/org/photonvision/server/RequestHandler.java b/photon-server/src/main/java/org/photonvision/server/RequestHandler.java
+index 1ca01a49..51ca60c0 100644
+--- a/photon-server/src/main/java/org/photonvision/server/RequestHandler.java
++++ b/photon-server/src/main/java/org/photonvision/server/RequestHandler.java
+@@ -772,6 +772,19 @@ public class RequestHandler {
+         }
+     }
+ 
++    /** SpectrumJetson (photonvision-54): each camera's tag contrast over the last 2 s (TagContrast). */
++    public static void onTagContrastRequest(Context ctx) {
++        var names = VisionSourceManager.getInstance().vmm.getModules().stream()
++                .map(m -> m.toUICameraConfig().nickname)
++                .toList();
++        try {
++            ctx.contentType("application/json");
++            ctx.result(kObjectMapper.writeValueAsString(org.photonvision.vision.target.TagContrast.summary(names)));
++        } catch (JsonProcessingException e) {
++            ctx.status(500);
++        }
++    }
++
+     public static void onCopySettingsRequest(Context ctx) {
+         CopySettingsRequest req;
+         try {
+diff --git a/photon-server/src/main/java/org/photonvision/server/Server.java b/photon-server/src/main/java/org/photonvision/server/Server.java
+index 9452f1b0..8b537223 100644
+--- a/photon-server/src/main/java/org/photonvision/server/Server.java
++++ b/photon-server/src/main/java/org/photonvision/server/Server.java
+@@ -135,6 +135,7 @@ public class Server {
+         app.post("/api/settings/createPipeline", RequestHandler::onCreatePipelineRequest); // SpectrumJetson (46)
+         app.get("/api/robotState", RequestHandler::onRobotStateRequest); // SpectrumJetson (50)
+         app.get("/api/healthCheck", RequestHandler::onHealthCheckRequest); // SpectrumJetson (52)
++        app.get("/api/tagContrast", RequestHandler::onTagContrastRequest); // SpectrumJetson (54)
+         app.get("/api/snapshots", RequestHandler::onSnapshotListRequest); // SpectrumJetson (53)
+         app.post("/api/snapshots", RequestHandler::onSnapshotCreateRequest);
+         app.post("/api/snapshots/restore", RequestHandler::onSnapshotRestoreRequest);

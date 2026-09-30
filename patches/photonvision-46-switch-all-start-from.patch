@@ -1,0 +1,424 @@
+diff --git a/photon-client/src/components/dashboard/CameraAndPipelineSelectCard.vue b/photon-client/src/components/dashboard/CameraAndPipelineSelectCard.vue
+index 1172d297..a4aae09e 100644
+--- a/photon-client/src/components/dashboard/CameraAndPipelineSelectCard.vue
++++ b/photon-client/src/components/dashboard/CameraAndPipelineSelectCard.vue
+@@ -143,16 +143,104 @@ const validNewPipelineTypes = computed(() => {
+   }
+   return pipelineTypes;
+ });
++// SpectrumJetson (photonvision-46): start from a copy of any camera's pipeline, and create it on
++// every camera at once (for profiles like 0 = Event, 1 = Practice field).
++const newPipelineSource = ref<string>("blank");
++const newPipelineOnAllCameras = ref(false);
++const newPipelineBusy = ref(false);
++const newPipelineSourceItems = computed<SelectItem[]>(() => [
++  { name: "Blank (the defaults)", value: "blank" },
++  ...Object.entries(useCameraSettingsStore().cameras).flatMap(([id, camera]) =>
++    (camera.pipelineNicknames ?? []).map((pipeline, index) => ({
++      name: `Copy of ${camera.nickname} / ${index}: ${pipeline}`,
++      value: JSON.stringify([id, index])
++    }))
++  )
++]);
+ const showCreatePipelineDialog = () => {
+   newPipelineName.value = "";
+   newPipelineType.value = useCameraSettingsStore().currentWebsocketPipelineType;
++  newPipelineSource.value = "blank";
++  newPipelineOnAllCameras.value = false;
+   showPipelineCreationDialog.value = true;
+ };
+-const createNewPipeline = () => {
++interface CreatePipelineResult {
++  created: { camera: string; index: number }[];
++  skipped: { camera: string; reason: string }[];
++}
++const describeCreated = (name: string, result: CreatePipelineResult): string => {
++  const byIndex = new Map<number, string[]>();
++  for (const c of result.created) byIndex.set(c.index, [...(byIndex.get(c.index) ?? []), c.camera]);
++  const parts = [...byIndex.entries()].map(([index, cameras]) => `as pipeline ${index} on ${cameras.join(", ")}`);
++  const created = parts.length ? `Created '${name}' ${parts.join("; ")}.` : `Created nothing.`;
++  const skipped = result.skipped.map((s) => `${s.camera}: ${s.reason}`).join("; ");
++  return skipped ? `${created} Skipped ${skipped}.` : created;
++};
++const createNewPipeline = async () => {
+   const type = newPipelineType.value;
+-  if (type === WebsocketPipelineType.DriverMode || type === WebsocketPipelineType.Calib3d) return;
+-  useCameraSettingsStore().createNewPipeline(newPipelineName.value, type);
+-  showPipelineCreationDialog.value = false;
++  const blank = newPipelineSource.value === "blank";
++  if (blank && (type === WebsocketPipelineType.DriverMode || type === WebsocketPipelineType.Calib3d)) return;
++  const current = useStateStore().currentCameraUniqueName;
++  const [fromCamera, fromPipeline] = blank ? [undefined, undefined] : JSON.parse(newPipelineSource.value);
++  const name = newPipelineName.value;
++  newPipelineBusy.value = true;
++  try {
++    const response = await axios.post<CreatePipelineResult>("/settings/createPipeline", {
++      name,
++      type: blank ? type : undefined,
++      fromCamera,
++      fromPipeline,
++      cameras: newPipelineOnAllCameras.value ? Object.keys(useCameraSettingsStore().cameras) : [current],
++      switchCamera: current
++    });
++    showPipelineCreationDialog.value = false;
++    useStateStore().showSnackbarMessage({
++      message: describeCreated(name, response.data),
++      color: response.data.skipped.length ? "warning" : "success",
++      timeout: 8000
++    });
++  } catch (e: any) {
++    const data = e?.response?.data;
++    useStateStore().showSnackbarMessage({
++      message: data?.skipped ? describeCreated(name, data) : `Couldn't create the pipeline: ${data || e}`,
++      color: "error",
++      timeout: 8000
++    });
++  } finally {
++    newPipelineBusy.value = false;
++  }
++};
++
++// SpectrumJetson (photonvision-46): every camera to the pipeline number shown here. Cameras without
++// that number stay where they are, as do cameras in driver mode or calibrating.
++const switchAllCameras = () => {
++  const store = useCameraSettingsStore();
++  const current = useStateStore().currentCameraUniqueName;
++  const index = store.currentCameraSettings.currentPipelineIndex;
++  const name = store.currentPipelineSettings.pipelineNickname;
++  const switched: string[] = [];
++  const skipped: string[] = [];
++  for (const [id, camera] of Object.entries(store.cameras)) {
++    if (id === current) continue;
++    if (camera.currentPipelineIndex === WebsocketPipelineType.DriverMode) {
++      skipped.push(`${camera.nickname} (driver mode)`);
++    } else if (
++      camera.currentPipelineIndex === WebsocketPipelineType.Calib3d ||
++      camera.currentPipelineIndex === WebsocketPipelineType.FocusCamera
++    ) {
++      skipped.push(`${camera.nickname} (calibrating or focusing)`);
++    } else if ((camera.pipelineNicknames?.length ?? 0) <= index) {
++      skipped.push(`${camera.nickname} (no pipeline ${index})`);
++    } else {
++      if (camera.currentPipelineIndex !== index) store.changeCurrentPipelineIndex(index, true, id);
++      const theirs = camera.pipelineNicknames[index];
++      switched.push(theirs === name ? camera.nickname : `${camera.nickname} (its ${index} is '${theirs}')`);
++    }
++  }
++  const message =
++    `Pipeline ${index}: ${switched.length ? `switched ${switched.join(", ")}` : "no other camera switched"}.` +
++    (skipped.length ? ` Not switched: ${skipped.join(", ")}.` : "");
++  useStateStore().showSnackbarMessage({ message, color: skipped.length ? "warning" : "success", timeout: 8000 });
+ };
+ const cancelPipelineCreation = () => {
+   showPipelineCreationDialog.value = false;
+@@ -414,6 +502,16 @@ const wrappedCameras = computed<SelectItem[]>(() =>
+                 <pv-icon color="#c5c5c5" :right="true" icon-name="mdi-content-copy" tooltip="Duplicate pipeline" />
+               </v-list-item-title>
+             </v-list-item>
++            <v-list-item @click="switchAllCameras">
++              <v-list-item-title>
++                <pv-icon
++                  color="#c5c5c5"
++                  :right="true"
++                  icon-name="mdi-swap-horizontal"
++                  :tooltip="`Switch every camera to pipeline ${useCameraSettingsStore().currentCameraSettings.currentPipelineIndex}`"
++                />
++              </v-list-item-title>
++            </v-list-item>
+             <v-list-item @click="openCopySettingsDialog">
+               <v-list-item-title>
+                 <pv-icon
+@@ -528,12 +626,30 @@ const wrappedCameras = computed<SelectItem[]>(() =>
+             :rules="[(v) => checkPipelineName(v)]"
+           />
+           <pv-select
++            v-model="newPipelineSource"
++            :select-cols="12 - 4"
++            label="Start from"
++            tooltip="Blank starts from the defaults. A copy takes every setting of that pipeline, including its type. From another camera, each camera keeps its own orientation, exposure limits, mask and, unless the video modes match, resolution."
++            :items="newPipelineSourceItems"
++          />
++          <pv-select
++            v-if="newPipelineSource === 'blank'"
+             v-model="newPipelineType"
+             :select-cols="12 - 4"
+             label="Tracking Type"
+             tooltip="Pipeline type, which changes the type of processing that will happen on input frames"
+             :items="validNewPipelineTypes"
+           />
++          <v-checkbox
++            v-model="newPipelineOnAllCameras"
++            density="compact"
++            hide-details
++            :label="`Create on every camera (${Object.keys(useCameraSettingsStore().cameras).length})`"
++          />
++          <p v-if="newPipelineOnAllCameras" class="text-caption pb-2">
++            Each camera gets it as its next pipeline number, so cameras with the same number of pipelines
++            get the same number. Only this camera switches to it.
++          </p>
+         </v-card-text>
+         <v-card-actions class="pr-5 pt-10px pb-5">
+           <v-btn
+@@ -546,7 +662,7 @@ const wrappedCameras = computed<SelectItem[]>(() =>
+           <v-btn
+             color="buttonActive"
+             :variant="theme.global.current.value.dark ? 'outlined' : 'elevated'"
+-            :disabled="checkPipelineName(newPipelineName) !== true"
++            :disabled="newPipelineBusy || checkPipelineName(newPipelineName) !== true"
+             @click="createNewPipeline"
+           >
+             Create
+diff --git a/photon-core/src/main/java/org/photonvision/vision/processes/VisionModule.java b/photon-core/src/main/java/org/photonvision/vision/processes/VisionModule.java
+index c1c83efc..7d706cc9 100644
+--- a/photon-core/src/main/java/org/photonvision/vision/processes/VisionModule.java
++++ b/photon-core/src/main/java/org/photonvision/vision/processes/VisionModule.java
+@@ -21,12 +21,15 @@ import edu.wpi.first.cscore.CameraServerJNI;
+ import edu.wpi.first.cscore.VideoException;
+ import edu.wpi.first.math.util.Units;
+ import io.javalin.websocket.WsContext;
++import java.io.IOException;
++import java.lang.reflect.Modifier;
+ import java.util.ArrayList;
+ import java.util.Collection;
+ import java.util.HashMap;
+ import java.util.LinkedList;
+ import java.util.List;
+ import java.util.Map;
++import java.util.Set;
+ import java.util.function.BiConsumer;
+ import org.opencv.core.Size;
+ import org.photonvision.common.configuration.CameraConfiguration;
+@@ -46,6 +49,7 @@ import org.photonvision.common.hardware.metrics.JetsonTelemetry;
+ import org.photonvision.common.logging.LogGroup;
+ import org.photonvision.common.logging.Logger;
+ import org.photonvision.common.util.SerializationUtils;
++import org.photonvision.common.util.file.JacksonUtils;
+ import org.photonvision.vision.calibration.CameraCalibrationCoefficients;
+ import org.photonvision.vision.camera.CameraQuirk;
+ import org.photonvision.vision.camera.CameraType;
+@@ -58,6 +62,7 @@ import org.photonvision.vision.frame.provider.USBFrameProvider;
+ import org.photonvision.vision.pipeline.AdvancedPipelineSettings;
+ import org.photonvision.vision.pipeline.CVPipelineSettings;
+ import org.photonvision.vision.pipeline.OutputStreamPipeline;
++import org.photonvision.vision.pipeline.PipelineType;
+ import org.photonvision.vision.pipeline.ReflectivePipelineSettings;
+ import org.photonvision.vision.pipeline.UICalibrationData;
+ import org.photonvision.vision.pipeline.result.CVPipelineResult;
+@@ -655,6 +660,74 @@ public class VisionModule {
+         return copied;
+     }
+ 
++    /**
++     * Fields that belong to the camera, not the pipeline: when a new pipeline starts from another
++     * camera's, it keeps this camera's own. SpectrumJetson (photonvision-46).
++     */
++    private static final Set<String> CAMERA_OWN_FIELDS =
++            Set.of(
++                    "inputImageRotationMode",
++                    "cameraMinExposureRaw",
++                    "cameraMaxExposureRaw",
++                    "detectionMask");
++
++    /**
++     * SpectrumJetson (photonvision-46): adds a pipeline called {@code nickname}, blank ({@code
++     * source} null, of {@code type}) or starting from a copy of {@code source}. From this camera's
++     * own pipeline it's an exact copy (as Duplicate). From another camera's, this camera keeps its
++     * orientation, exposure limits and mask, and its resolution unless the video modes match.
++     *
++     * @return the new pipeline's index
++     */
++    public int createPipeline(
++            String nickname,
++            PipelineType type,
++            CVPipelineSettings source,
++            boolean sourceIsThisCamera,
++            boolean sameVideoModes,
++            boolean switchToIt) {
++        if (pipelineManager.getPipelineNicknames().contains(nickname)) {
++            throw new IllegalArgumentException("already has a pipeline called " + nickname);
++        }
++        var added = pipelineManager.addPipeline(source == null ? type : source.pipelineType, nickname);
++        if (added == null) throw new IllegalArgumentException("can't make a " + type + " pipeline");
++        if (source != null) {
++            CVPipelineSettings copy;
++            try {
++                // A deep copy: clone() would share the mask, HSV ranges and offset points.
++                copy =
++                        JacksonUtils.deserialize(
++                                JacksonUtils.serializeToString(source), CVPipelineSettings.class);
++            } catch (IOException e) {
++                throw new IllegalArgumentException("couldn't copy the pipeline: " + e.getMessage());
++            }
++            for (var field : copy.getClass().getFields()) {
++                int mods = field.getModifiers();
++                if (Modifier.isStatic(mods) || Modifier.isFinal(mods)) continue;
++                String name = field.getName();
++                if (name.equals("pipelineIndex") || name.equals("pipelineNickname")) continue;
++                if (!sourceIsThisCamera && CAMERA_OWN_FIELDS.contains(name)) continue;
++                if (!sourceIsThisCamera && !sameVideoModes && name.equals("cameraVideoModeIndex")) continue;
++                try {
++                    field.set(added, field.get(copy));
++                } catch (IllegalAccessException e) {
++                    logger.error("Could not copy " + name, e);
++                }
++            }
++        }
++        int index = pipelineManager.getPipelineNicknames().indexOf(nickname);
++        logger.info(
++                "Created pipeline "
++                        + index
++                        + " '"
++                        + nickname
++                        + "'"
++                        + (source == null ? " (blank " + type + ")" : " from '" + source.pipelineNickname + "'"));
++        if (switchToIt) setPipeline(index);
++        saveAndBroadcastAll();
++        return index;
++    }
++
+     boolean setPipeline(int index) {
+         logger.info("Setting pipeline to " + index);
+         logger.info("Pipeline name: " + pipelineManager.getPipelineNickname(index));
+diff --git a/photon-server/src/main/java/org/photonvision/server/RequestHandler.java b/photon-server/src/main/java/org/photonvision/server/RequestHandler.java
+index be0710f7..bc8c15ba 100644
+--- a/photon-server/src/main/java/org/photonvision/server/RequestHandler.java
++++ b/photon-server/src/main/java/org/photonvision/server/RequestHandler.java
+@@ -66,6 +66,9 @@ import org.photonvision.vision.camera.PVCameraInfo;
+ import org.photonvision.vision.objects.ObjectDetector;
+ import org.photonvision.vision.objects.RknnModel;
+ import org.photonvision.vision.objects.RubikModel;
++import org.photonvision.vision.pipeline.CVPipelineSettings;
++import org.photonvision.vision.pipeline.PipelineType;
++import org.photonvision.vision.processes.VisionModule;
+ import org.photonvision.vision.processes.VisionSourceManager;
+ import org.zeroturnaround.zip.ZipUtil;
+ 
+@@ -491,6 +494,21 @@ public class RequestHandler {
+             camera.put("pipelineNicknames", ui.pipelineNicknames);
+             camera.put("currentPipelineSettings", ui.currentPipelineSettings);
+             camera.put("extraControls", ui.extraControls);
++            // Every pipeline's saved settings, not only the running one's (photonvision-46).
++            var pipelines = new ArrayList<Object>();
++            for (int i = 0; i < ui.pipelineNicknames.size(); i++) {
++                var settings = module.getPipelineSettingsAt(i);
++                if (settings == null) break; // deleted while we were reading
++                try {
++                    // Saved settings are ["type", {...}] (Jackson's wrapper-array type info).
++                    Object tree = kObjectMapper.readValue(JacksonUtils.serializeToString(settings), Object.class);
++                    if (tree instanceof List<?> pair && pair.size() == 2) tree = pair.get(1);
++                    pipelines.add(tree);
++                } catch (Exception e) {
++                    pipelines.add(Map.of("error", String.valueOf(e.getMessage())));
++                }
++            }
++            camera.put("pipelines", pipelines);
+             cameras.add(camera);
+         }
+         try {
+@@ -502,6 +520,94 @@ public class RequestHandler {
+         }
+     }
+ 
++    private record CreatePipelineRequest(
++            String name,
++            Integer type,
++            String fromCamera,
++            Integer fromPipeline,
++            List<String> cameras,
++            String switchCamera) {}
++
++    /**
++     * SpectrumJetson (photonvision-46): the new-pipeline dialog. Creates pipeline {@code name} on
++     * each of {@code cameras}: blank of {@code type} (the dashboard's pipeline type number), or
++     * starting from {@code fromCamera}'s pipeline {@code fromPipeline}. {@code switchCamera} (the one
++     * on the dashboard) switches to its new pipeline; the others stay on theirs. A camera that
++     * already has a pipeline with that name is skipped. Answers {created: [{camera, index}],
++     * skipped: [{camera, reason}]}.
++     */
++    public static void onCreatePipelineRequest(Context ctx) {
++        CreatePipelineRequest req;
++        try {
++            req = kObjectMapper.readValue(ctx.body(), CreatePipelineRequest.class);
++        } catch (IOException e) {
++            ctx.status(400);
++            ctx.result("Expected {name, type or fromCamera and fromPipeline, cameras, switchCamera}");
++            return;
++        }
++        var vmm = VisionSourceManager.getInstance().vmm;
++        if (req.name() == null || req.name().isBlank() || req.cameras() == null || req.cameras().isEmpty()) {
++            ctx.status(400);
++            ctx.result("A name and at least one camera are needed");
++            return;
++        }
++        VisionModule from = null;
++        CVPipelineSettings source = null;
++        PipelineType type = null;
++        if (req.fromCamera() != null) {
++            from = vmm.getModule(req.fromCamera());
++            source =
++                    from == null || req.fromPipeline() == null
++                            ? null
++                            : from.getPipelineSettingsAt(req.fromPipeline());
++            if (source == null) {
++                ctx.status(400);
++                ctx.result("Unknown camera or pipeline to start from");
++                return;
++            }
++        } else {
++            // The dashboard numbers types from -3 (FocusCamera); PipelineType starts there too.
++            int t = req.type() == null ? -99 : req.type() + 3;
++            if (t < 0 || t >= PipelineType.values().length) {
++                ctx.status(400);
++                ctx.result("Unknown pipeline type " + req.type());
++                return;
++            }
++            type = PipelineType.values()[t];
++        }
++        var created = new ArrayList<Map<String, Object>>();
++        var skipped = new ArrayList<Map<String, Object>>();
++        for (String id : req.cameras()) {
++            var to = vmm.getModule(id);
++            if (to == null) {
++                skipped.add(Map.of("camera", id, "reason", "no such camera"));
++                continue;
++            }
++            String nickname = to.toUICameraConfig().nickname;
++            try {
++                int index =
++                        to.createPipeline(
++                                req.name(),
++                                type,
++                                source,
++                                to == from,
++                                from != null && from.videoModeList().equals(to.videoModeList()),
++                                id.equals(req.switchCamera()));
++                created.add(Map.of("camera", nickname, "index", index));
++            } catch (IllegalArgumentException e) {
++                skipped.add(Map.of("camera", nickname, "reason", e.getMessage()));
++            }
++        }
++        try {
++            ctx.status(created.isEmpty() ? 400 : 200);
++            ctx.contentType("application/json");
++            ctx.result(kObjectMapper.writeValueAsString(Map.of("created", created, "skipped", skipped)));
++        } catch (JsonProcessingException e) {
++            ctx.status(500);
++            ctx.result("Created, but could not report what was created");
++        }
++    }
++
+     public static void onCopySettingsRequest(Context ctx) {
+         CopySettingsRequest req;
+         try {
+diff --git a/photon-server/src/main/java/org/photonvision/server/Server.java b/photon-server/src/main/java/org/photonvision/server/Server.java
+index e8a218fd..2b219f6f 100644
+--- a/photon-server/src/main/java/org/photonvision/server/Server.java
++++ b/photon-server/src/main/java/org/photonvision/server/Server.java
+@@ -132,6 +132,7 @@ public class Server {
+         app.post("/api/settings/copySettings", RequestHandler::onCopySettingsRequest); // SpectrumJetson
+         // Read-only view of what each camera's dashboard shows, for tests/ui (SpectrumJetson 45)
+         app.get("/api/spectrum/uiState", RequestHandler::onUiStateRequest);
++        app.post("/api/settings/createPipeline", RequestHandler::onCreatePipelineRequest); // SpectrumJetson (46)
+         app.get("/api/excludedTags", RequestHandler::onExcludedTagsRequest); // SpectrumJetson
+         app.post("/api/excludedTags", RequestHandler::onExcludedTagsSetRequest);
+         app.get("/api/rewind", RequestHandler::onRewindStatusRequest);

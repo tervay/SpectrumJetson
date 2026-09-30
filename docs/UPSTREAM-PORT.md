@@ -161,3 +161,44 @@ v2026.3.4) teaches PhotonVision about our camera (USB `1bcf:28c5`):
   JNI, and installing one needs sudo). They run on the Jetson in practice.
 - The jar's version string is still `dev-v2026.1.1-27-gd8c9e8e1`: the build script applies
   patches on d8c9e8e, so `git describe` doesn't change. Tell builds apart by sha256.
+
+## Upstream review, 2026-09-29
+
+Everything merged after #2528, and open issues updated in 2026 that match our setup.
+
+- **Don't take anything from `main` after #2566 (2026-09-17, WPILib alpha-7)** while the robot is on
+  alpha-6 with photonlib alpha-2. It changes `PhotonPipelineMetadata` to nanoseconds (hash
+  `ac0a45f6…` → `5231116d…`) and renames the time-sync topics (`offset_us` → `offset_ns`). The
+  coprocessor and photonlib have to move together.
+- **Ported:** #2617 (`currentVideoFormat` can be undefined while a camera activates; tabs vanished),
+  as `photonvision-42`, adapted to our base plus two more unguarded spots (the stream's aspect
+  ratio, the 3D view). #2352 (a disabled config reactivated onto a device already in use; the delete
+  dialog named the wrong camera; identical cameras' cards all titled "Thrifty:"), as
+  `photonvision-44`.
+- **Already had:** #2629 (release a frame dropped because the pipeline changed mid-grab):
+  `photonvision-11` has had that release since 2026-09-24. Its crop half doesn't apply: our base
+  has no static crop.
+- **Kept as notes:**
+  - [#2443](https://github.com/PhotonVision/photonvision/issues/2443): `setPipelineIndex` from robot
+    code goes from ~50 ms to up to 9.5 s after a few switches (2 OV9281s, 2026.3.2; no root cause).
+    Only matters if robot code switches pipelines in a match; test it on the robot first if so.
+  - [#2613](https://github.com/PhotonVision/photonvision/issues/2613) /
+    [#2628](https://github.com/PhotonVision/photonvision/issues/2628): 90° image rotation breaks the
+    multi-tag pose (0.3–0.4 m), confirmed on the libcamera path. If a camera is ever mounted
+    rotated, compare our multi-tag pose with a solvePnP on the published corners.
+  - [#1946](https://github.com/PhotonVision/photonvision/issues/1946): an OV9281 dropping off USB for
+    8–10 s about every two hours (ESD or cabling). Our watchdog now really reopens a stuck camera
+    (`photonvision-43`); a camera that drops off USB comes back through cscore's own reconnect once
+    the kernel re-enumerates it.
+  - [#2614](https://github.com/PhotonVision/photonvision/issues/2614): every UI change saves at
+    once, no undo. A README note (duplicate the pipeline before experimenting; settings from any
+    match are in the robot log and Rewind).
+  - #2574 and #2344 (mrcal corner IDs, calibration uncertainty plots): watch.
+  - #2586 / #2351 (virtual cameras, a combined tag and object-detection pipeline): watch, for the
+    2027 combined camera.
+- **Ours that upstream doesn't have yet** (not sent: ask Allen first): the S_FMT EBUSY camera stuck
+  at a low resolution and its `kForceClose` recovery that never reopens (`-37`, `-43`), the
+  startup `ConcurrentModificationException` that kills a camera thread (`-38`), the inverted
+  "Failed to set video mode" log (`-37`), other dashboards never getting setting changes (`-41`),
+  and the extra camera control sliders (`-39`). Open upstream PR #2633 does our direct gray decode,
+  but turns off frame blocking in gray mode, which could hand out repeated frames.

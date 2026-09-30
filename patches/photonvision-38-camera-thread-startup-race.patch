@@ -1,0 +1,48 @@
+--- a/photon-core/src/main/java/org/photonvision/vision/processes/VisionModuleManager.java
++++ b/photon-core/src/main/java/org/photonvision/vision/processes/VisionModuleManager.java
+@@ -18,6 +18,7 @@
+ package org.photonvision.vision.processes;
+ 
+ import java.util.*;
++import java.util.concurrent.CopyOnWriteArrayList;
+ import org.photonvision.common.logging.LogGroup;
+ import org.photonvision.common.logging.Logger;
+ 
+@@ -25,7 +26,11 @@
+ public class VisionModuleManager {
+     private final Logger logger = new Logger(VisionModuleManager.class, LogGroup.VisionModule);
+ 
+-    private final List<VisionModule> visionModules = new ArrayList<>();
++    // SpectrumJetson (photonvision-38): copy-on-write, because camera threads iterate this list
++    // (UIPhotonConfiguration.programStateToUi, from VisionRunner) while VisionSourceManager is still
++    // adding cameras at startup. With an ArrayList that threw ConcurrentModificationException in the
++    // camera's own thread and killed it: that camera never ran until PhotonVision restarted.
++    private final List<VisionModule> visionModules = new CopyOnWriteArrayList<>();
+ 
+     VisionModuleManager() {}
+ 
+--- a/photon-core/src/main/java/org/photonvision/vision/processes/VisionRunner.java
++++ b/photon-core/src/main/java/org/photonvision/vision/processes/VisionRunner.java
+@@ -178,11 +178,17 @@
+             }
+         }
+ 
+-        DataChangeService.getInstance()
+-                .publishEvent(
+-                        new OutgoingUIEvent<>(
+-                                "fullsettings",
+-                                UIPhotonConfiguration.programStateToUi(ConfigManager.getInstance().getConfig())));
++        // SpectrumJetson (photonvision-38): a failure building the UI's state must not end this
++        // camera's thread.
++        try {
++            DataChangeService.getInstance()
++                    .publishEvent(
++                            new OutgoingUIEvent<>(
++                                    "fullsettings",
++                                    UIPhotonConfiguration.programStateToUi(ConfigManager.getInstance().getConfig())));
++        } catch (Exception e) {
++            logger.error("Couldn't send the settings to the UI", e);
++        }
+ 
+         while (!Thread.interrupted()) {
+             long start = System.currentTimeMillis();

@@ -1,0 +1,391 @@
+diff --git a/photon-client/src/components/dashboard/CamerasCard.vue b/photon-client/src/components/dashboard/CamerasCard.vue
+index c94ebb21..4c30fe8a 100644
+--- a/photon-client/src/components/dashboard/CamerasCard.vue
++++ b/photon-client/src/components/dashboard/CamerasCard.vue
+@@ -1,5 +1,6 @@
+ <script setup lang="ts">
+-import { computed } from "vue";
++import { computed, onBeforeUnmount, onMounted } from "vue";
++import { loadRobotState, robotState, setRobotState } from "@/lib/RobotState";
+ import { useCameraSettingsStore } from "@/stores/settings/CameraSettingsStore";
+ import { useStateStore } from "@/stores/StateStore";
+ import { useSettingsStore } from "@/stores/settings/GeneralSettingsStore";
+@@ -17,6 +18,15 @@ const maskEditing = computed(() => useStateStore().maskEditing && !useCameraSett
+ 
+ const value = defineModel<number[]>();
+ 
++// photonvision-50: say when the cameras are idling because the robot is disabled (photonvision-49),
++// with a button to run them at full speed for testing.
++let robotStateTimer: ReturnType<typeof setInterval> | undefined;
++onMounted(() => {
++  loadRobotState();
++  robotStateTimer = setInterval(loadRobotState, 2000);
++});
++onBeforeUnmount(() => clearInterval(robotStateTimer));
++
+ const driverMode = computed<boolean>({
+   get: () => useCameraSettingsStore().isDriverMode,
+   set: (v) => useCameraSettingsStore().setDriverMode(v)
+@@ -72,6 +82,20 @@ const performanceRecommendation = computed<string>(() => {
+         hide-details="auto"
+       />
+     </v-card-title>
++    <v-alert
++      v-if="robotState?.idleNow"
++      data-testid="idle-notice"
++      class="ml-3 mr-3 mb-2"
++      density="compact"
++      type="info"
++      variant="tonal"
++      icon="mdi-sleep"
++    >
++      Robot disabled: cameras idle at {{ robotState.idleFps }} fps, full speed on enable.
++      <template #append>
++        <v-btn size="small" variant="text" @click="setRobotState({ idleWhileDisabled: false })">Full speed</v-btn>
++      </template>
++    </v-alert>
+     <v-divider class="ml-3 mr-3" />
+     <v-row class="stream-viewer-container pa-3 align-center">
+       <v-col v-if="value?.includes(0)" class="stream-view">
+diff --git a/photon-client/src/components/settings/RobotStateCard.vue b/photon-client/src/components/settings/RobotStateCard.vue
+new file mode 100644
+index 00000000..5e5eaa95
+--- /dev/null
++++ b/photon-client/src/components/settings/RobotStateCard.vue
+@@ -0,0 +1,73 @@
++<script setup lang="ts">
++// SpectrumJetson (photonvision-50): the robot's state as PhotonVision sees it, and idle mode
++// (photonvision-49): fewer frames while the robot is disabled, switchable for full-speed tests.
++import { onBeforeUnmount, onMounted, ref } from "vue";
++import PvSwitch from "@/components/common/pv-switch.vue";
++import PvSlider from "@/components/common/pv-slider.vue";
++import { useStateStore } from "@/stores/StateStore";
++import { useTheme } from "vuetify";
++import { loadRobotState, robotState, setRobotState } from "@/lib/RobotState";
++
++const theme = useTheme();
++const busy = ref(false);
++let timer: ReturnType<typeof setInterval> | undefined;
++
++const set = async (change: { idleWhileDisabled?: boolean; idleFps?: number }) => {
++  busy.value = true;
++  try {
++    await setRobotState(change);
++  } catch {
++    useStateStore().showSnackbarMessage({ message: "Couldn't change idle mode", color: "error" });
++  } finally {
++    busy.value = false;
++  }
++};
++
++onMounted(() => {
++  loadRobotState();
++  timer = setInterval(loadRobotState, 1000);
++});
++onBeforeUnmount(() => clearInterval(timer));
++</script>
++
++<template>
++  <v-card v-if="robotState" class="mb-3 rounded-12" color="surface">
++    <v-card-title class="pb-10px">Robot state</v-card-title>
++    <v-card-text class="pt-0">
++      <v-alert
++        class="mb-3"
++        density="compact"
++        :color="robotState.idleNow ? 'warning' : 'buttonActive'"
++        :icon="robotState.robotConnected ? 'mdi-robot' : 'mdi-robot-off'"
++        :variant="theme.global.current.value.dark ? 'tonal' : 'elevated'"
++      >
++        <template v-if="!robotState.robotConnected">No robot connected: every camera runs at full speed.</template>
++        <template v-else>
++          Robot
++          <b>{{ robotState.enabled ? (robotState.autonomous ? "enabled (auto)" : "enabled") : "disabled" }}</b
++          >{{ robotState.fmsAttached ? ", field (FMS) connected" : "" }}.
++          {{ robotState.idleNow ? `Cameras idling at ${robotState.idleFps} fps.` : "Cameras at full speed." }}
++        </template>
++      </v-alert>
++      <pv-switch
++        :model-value="robotState.idleWhileDisabled"
++        :disabled="busy"
++        label="Idle while the robot is disabled"
++        tooltip="While a robot is connected and disabled, each camera processes only this many frames a second: less power and heat between matches, and still plenty to set the starting pose. Full speed again within 5 ms of enable. Turn off to test full speed with the robot disabled."
++        :label-cols="4"
++        @update:model-value="(v) => set({ idleWhileDisabled: !!v })"
++      />
++      <pv-slider
++        :model-value="robotState.idleFps"
++        :disabled="busy || !robotState.idleWhileDisabled"
++        label="Idle frames a second"
++        tooltip="Per camera, while the robot is disabled. 30 is plenty to set the pose before auto."
++        :min="5"
++        :max="60"
++        :step="5"
++        :slider-cols="8"
++        @update:model-value="(v) => set({ idleFps: v })"
++      />
++    </v-card-text>
++  </v-card>
++</template>
+diff --git a/photon-client/src/lib/RobotState.ts b/photon-client/src/lib/RobotState.ts
+new file mode 100644
+index 00000000..fcdef3a8
+--- /dev/null
++++ b/photon-client/src/lib/RobotState.ts
+@@ -0,0 +1,28 @@
++// SpectrumJetson (photonvision-50): /api/robotState, shared by Settings > Robot state and the
++// dashboard's idle notice.
++import { ref } from "vue";
++import axios from "axios";
++
++export interface RobotState {
++  idleWhileDisabled: boolean;
++  idleFps: number;
++  robotConnected: boolean;
++  enabled: boolean;
++  autonomous: boolean;
++  fmsAttached: boolean;
++  idleNow: boolean;
++}
++
++export const robotState = ref<RobotState | null>(null);
++
++export const loadRobotState = async () => {
++  try {
++    robotState.value = (await axios.get<RobotState>("/robotState")).data;
++  } catch {
++    robotState.value = null;
++  }
++};
++
++export const setRobotState = async (change: { idleWhileDisabled?: boolean; idleFps?: number }) => {
++  robotState.value = (await axios.post<RobotState>("/robotState", change)).data;
++};
+diff --git a/photon-client/src/views/GeneralSettingsView.vue b/photon-client/src/views/GeneralSettingsView.vue
+index f55f505f..2edcf737 100644
+--- a/photon-client/src/views/GeneralSettingsView.vue
++++ b/photon-client/src/views/GeneralSettingsView.vue
+@@ -6,12 +6,14 @@ import { useSettingsStore } from "@/stores/settings/GeneralSettingsStore";
+ import ApriltagControlCard from "@/components/settings/ApriltagControlCard.vue";
+ import DeviceCard from "@/components/settings/DeviceCard.vue";
+ import RewindCard from "@/components/settings/RewindCard.vue";
++import RobotStateCard from "@/components/settings/RobotStateCard.vue";
+ </script>
+ 
+ <template>
+   <div class="pa-3">
+     <DeviceCard />
+     <GlobalSettingsCard />
++    <RobotStateCard />
+     <RewindCard />
+     <ObjectDetectionCard v-if="useSettingsStore().general.supportedBackends.length > 0" />
+     <LightingControlCard v-if="useSettingsStore().lighting.supported" />
+diff --git a/photon-core/src/main/java/org/photonvision/vision/processes/IdleMode.java b/photon-core/src/main/java/org/photonvision/vision/processes/IdleMode.java
+index d0f3deab..b2ebfa55 100644
+--- a/photon-core/src/main/java/org/photonvision/vision/processes/IdleMode.java
++++ b/photon-core/src/main/java/org/photonvision/vision/processes/IdleMode.java
+@@ -17,14 +17,20 @@
+ 
+ package org.photonvision.vision.processes;
+ 
++import com.fasterxml.jackson.databind.DeserializationFeature;
++import com.fasterxml.jackson.databind.ObjectMapper;
++import java.io.IOException;
+ import java.lang.management.ManagementFactory;
++import java.nio.file.Files;
++import java.nio.file.Path;
+ import org.photonvision.common.dataflow.networktables.NetworkTablesManager;
+ import org.photonvision.common.logging.LogGroup;
+ import org.photonvision.common.logging.Logger;
+ 
+ /**
+  * SpectrumJetson (photonvision-49): while connected to a robot that is disabled, each camera
+- * processes at most SPECTRUM_IDLE_FPS frames a second (default 30; 0 = off). The frames in between
++ * processes at most idleFps frames a second (default 30, or SPECTRUM_IDLE_FPS; switched off or
++ * changed from Settings > Robot state, photonvision-50). The frames in between
+  * are never grabbed, so neither the JPEG decode nor the detector runs for them: less power and
+  * heat between matches, and 30 results a second is still plenty to seed the pose before auto. Full
+  * rate again within 5 ms of enable. Off the robot (no NetworkTables connection) nothing changes,
+@@ -35,10 +41,22 @@ import org.photonvision.common.logging.Logger;
+  */
+ public final class IdleMode {
+     private static final Logger logger = new Logger(IdleMode.class, LogGroup.VisionModule);
+-    private static final double IDLE_FPS = readFps();
+-    private static final long PERIOD_NANOS = IDLE_FPS > 0 ? (long) (1e9 / IDLE_FPS) : 0;
+     private static volatile boolean listening = false;
+ 
++    /**
++     * Saved in /opt/photonvision/spectrum-robot-state.json (photonvision-50), set from Settings >
++     * Robot state or the dashboard's "Full speed" button. SPECTRUM_IDLE_FPS is only the default.
++     */
++    public static class Settings {
++        public boolean idleWhileDisabled = true;
++        public double idleFps = readFps();
++    }
++
++    private static final Path SETTINGS_FILE = Path.of("/opt/photonvision/spectrum-robot-state.json");
++    private static final ObjectMapper json = new ObjectMapper().configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
++    private static volatile Settings settings = load();
++    private static volatile long periodNanos = period(settings);
++
+     private IdleMode() {}
+ 
+     private static double readFps() {
+@@ -51,9 +69,46 @@ public final class IdleMode {
+         }
+     }
+ 
++    private static Settings load() {
++        try {
++            if (Files.exists(SETTINGS_FILE)) return json.readValue(SETTINGS_FILE.toFile(), Settings.class);
++        } catch (IOException e) {
++            logger.error("Couldn't read " + SETTINGS_FILE + "; using the defaults", e);
++        }
++        return new Settings();
++    }
++
++    private static long period(Settings s) {
++        return s.idleWhileDisabled && s.idleFps > 0 ? (long) (1e9 / s.idleFps) : 0;
++    }
++
++    public static Settings getSettings() {
++        return settings;
++    }
++
++    /** Changes and saves the settings; null leaves a field as it is. */
++    public static synchronized Settings update(Boolean idleWhileDisabled, Double idleFps) {
++        var s = new Settings();
++        s.idleWhileDisabled = idleWhileDisabled != null ? idleWhileDisabled : settings.idleWhileDisabled;
++        s.idleFps = idleFps != null ? Math.max(1, Math.min(120, idleFps)) : settings.idleFps;
++        settings = s;
++        periodNanos = period(s);
++        try {
++            json.writeValue(SETTINGS_FILE.toFile(), s);
++        } catch (IOException e) {
++            logger.error("Couldn't save " + SETTINGS_FILE, e);
++        }
++        logger.info(
++                s.idleWhileDisabled
++                        ? "Idle mode on: " + s.idleFps + " fps per camera while the robot is disabled"
++                        : "Idle mode off: full speed while the robot is disabled");
++        return s;
++    }
++
+     /** True while frames should be limited: a robot is connected and disabled. */
+     public static boolean active() {
+-        if (PERIOD_NANOS == 0) return false;
++        if (!listening) startListening(); // the GC on disable runs with idle off too
++        if (periodNanos == 0) return false;
+         var ntm = NetworkTablesManager.getInstance();
+         if (!ntm.getNTInst().isConnected()) return false;
+         var ds = ntm.getDriverStation();
+@@ -61,7 +116,7 @@ public final class IdleMode {
+     }
+ 
+     public static long periodNanos() {
+-        return PERIOD_NANOS;
++        return periodNanos;
+     }
+ 
+     /**
+@@ -69,9 +124,8 @@ public final class IdleMode {
+      * robot is enabled. Returns false if interrupted.
+      */
+     public static boolean waitForNextFrame(long lastGrabNanos) {
+-        startListening();
+         while (active()) {
+-            long waitNanos = lastGrabNanos + PERIOD_NANOS - System.nanoTime();
++            long waitNanos = lastGrabNanos + periodNanos - System.nanoTime();
+             if (waitNanos <= 0) break;
+             try {
+                 Thread.sleep(Math.max(1, Math.min(5, waitNanos / 1_000_000)));
+@@ -83,15 +137,32 @@ public final class IdleMode {
+         return true;
+     }
+ 
++    /** For Settings > Robot state and the dashboard (photonvision-50). */
++    public static java.util.Map<String, Object> status() {
++        var ntm = NetworkTablesManager.getInstance();
++        var ds = ntm.getDriverStation();
++        var word = ds == null ? null : ds.current();
++        boolean connected = ntm.getNTInst().isConnected();
++        var m = new java.util.HashMap<String, Object>();
++        m.put("idleWhileDisabled", settings.idleWhileDisabled);
++        m.put("idleFps", settings.idleFps);
++        m.put("robotConnected", connected);
++        m.put("enabled", connected && word != null && word.m_enabled());
++        m.put("autonomous", connected && word != null && word.m_autonomous());
++        m.put("fmsAttached", connected && word != null && word.m_fmsAttached());
++        m.put("idleNow", active());
++        return m;
++    }
++
+     private static synchronized void startListening() {
+         if (listening) return;
+         var ds = NetworkTablesManager.getInstance().getDriverStation();
+         if (ds == null) return;
+         listening = true;
+         logger.info(
+-                IDLE_FPS > 0
+-                        ? "Idle mode: " + IDLE_FPS + " fps per camera while the robot is disabled"
+-                        : "Idle mode off (SPECTRUM_IDLE_FPS=0)");
++                periodNanos > 0
++                        ? "Idle mode: " + settings.idleFps + " fps per camera while the robot is disabled"
++                        : "Idle mode off: full speed while the robot is disabled");
+         ds.addTransitionListener(
+                 (old, now) -> {
+                     if (old.m_enabled() && !now.m_enabled()) {
+diff --git a/photon-server/src/main/java/org/photonvision/server/RequestHandler.java b/photon-server/src/main/java/org/photonvision/server/RequestHandler.java
+index 9931fb0c..ba2edadd 100644
+--- a/photon-server/src/main/java/org/photonvision/server/RequestHandler.java
++++ b/photon-server/src/main/java/org/photonvision/server/RequestHandler.java
+@@ -68,6 +68,7 @@ import org.photonvision.vision.objects.RknnModel;
+ import org.photonvision.vision.objects.RubikModel;
+ import org.photonvision.vision.pipeline.CVPipelineSettings;
+ import org.photonvision.vision.pipeline.PipelineType;
++import org.photonvision.vision.processes.IdleMode;
+ import org.photonvision.vision.processes.VisionModule;
+ import org.photonvision.vision.processes.VisionSourceManager;
+ import org.zeroturnaround.zip.ZipUtil;
+@@ -609,6 +610,29 @@ public class RequestHandler {
+         }
+     }
+ 
++    private record RobotStateRequest(Boolean idleWhileDisabled, Double idleFps) {}
++
++    /** SpectrumJetson (photonvision-50): idle mode's settings and the robot's state. */
++    public static void onRobotStateRequest(Context ctx) {
++        try {
++            ctx.contentType("application/json");
++            ctx.result(kObjectMapper.writeValueAsString(IdleMode.status()));
++        } catch (JsonProcessingException e) {
++            ctx.status(500);
++        }
++    }
++
++    public static void onRobotStateSetRequest(Context ctx) {
++        try {
++            var req = kObjectMapper.readValue(ctx.body(), RobotStateRequest.class);
++            IdleMode.update(req.idleWhileDisabled(), req.idleFps());
++            onRobotStateRequest(ctx);
++        } catch (IOException e) {
++            ctx.status(400);
++            ctx.result("Expected {idleWhileDisabled, idleFps}");
++        }
++    }
++
+     public static void onCopySettingsRequest(Context ctx) {
+         CopySettingsRequest req;
+         try {
+diff --git a/photon-server/src/main/java/org/photonvision/server/Server.java b/photon-server/src/main/java/org/photonvision/server/Server.java
+index 2b219f6f..75f58e11 100644
+--- a/photon-server/src/main/java/org/photonvision/server/Server.java
++++ b/photon-server/src/main/java/org/photonvision/server/Server.java
+@@ -133,6 +133,8 @@ public class Server {
+         // Read-only view of what each camera's dashboard shows, for tests/ui (SpectrumJetson 45)
+         app.get("/api/spectrum/uiState", RequestHandler::onUiStateRequest);
+         app.post("/api/settings/createPipeline", RequestHandler::onCreatePipelineRequest); // SpectrumJetson (46)
++        app.get("/api/robotState", RequestHandler::onRobotStateRequest); // SpectrumJetson (50)
++        app.post("/api/robotState", RequestHandler::onRobotStateSetRequest);
+         app.get("/api/excludedTags", RequestHandler::onExcludedTagsRequest); // SpectrumJetson
+         app.post("/api/excludedTags", RequestHandler::onExcludedTagsSetRequest);
+         app.get("/api/rewind", RequestHandler::onRewindStatusRequest);

@@ -1,0 +1,183 @@
+--- a/third_party/971apriltag/apriltag.cc
++++ b/third_party/971apriltag/apriltag.cc
+@@ -82,6 +82,23 @@
+   return knob.Get() != 0;
+ }
+ 
++// SpectrumJetson: the first stage as one CUDA graph (GpuDetector::RecordFirstStageGraph): 13 CUDA calls
++// a frame become one, and each of those calls took libcuda's lock that all cameras share. Only
++// with the fused BlobDiff, a gray image and no event timing. "0" in /tmp/spectrum-971-graph
++// launches the steps one by one again (re-read every 2 s).
++bool SpectrumGraphFirstStage() {
++  static SpectrumKnob knob("/tmp/spectrum-971-graph", 1);
++  return knob.Get() != 0;
++}
++
++constexpr size_t kBlobDiffBlockWidth = 32;
++constexpr size_t kBlobDiffBlockHeight = 16;
++// BlobDiff's grid: overlap 1 on each side in x, and 1 in y.
++dim3 BlobDiffBlocks(size_t decimated_width, size_t decimated_height) {
++  return dim3((decimated_width + kBlobDiffBlockWidth - 3) / (kBlobDiffBlockWidth - 2),
++              (decimated_height + kBlobDiffBlockHeight - 2) / (kBlobDiffBlockHeight - 1), 1);
++}
++
+ typedef std::chrono::duration<float, std::milli> float_milli;
+ 
+ // Returns true if the QuadBoundaryPoint is nonzero.
+@@ -254,6 +271,7 @@
+ }
+ 
+ GpuDetector::~GpuDetector() {
++  if (first_stage_exec_) cudaGraphExecDestroy(first_stage_exec_);
+   for (int i = 0; i < zarray_size(detections_); ++i) {
+     apriltag_detection_t* det;
+     zarray_get(detections_, i, &det);
+@@ -815,6 +833,72 @@
+ 
+ }  // namespace
+ 
++// The GPU buffer Detect() thresholds: the caller's, or its own copy of a host image.
++static const uint8_t* FirstStageInput(const uint8_t* image_device, const uint8_t* own) {
++  return image_device ? image_device : own;
++}
++
++bool GpuDetector::FirstStageGraphWanted(const uint8_t* image_device) {
++  if (first_stage_failed_ || image_format_ != vision::ImageFormat::MONO8 || (width_ % 8) != 0 ||
++      (height_ % 8) != 0 || width_ * height_ >= static_cast<size_t>(1 << 22) ||
++      !SpectrumGraphFirstStage() || !SpectrumFusedBlobDiff() || SpectrumEventTiming()) {
++    return false;
++  }
++  return !first_stage_exec_ ||
++         first_stage_image_ != FirstStageInput(image_device, gray_image_device_.get()) ||
++         first_stage_mwbd_ != tag_detector_->qtp.min_white_black_diff;
++}
++
++absl::Status GpuDetector::RecordFirstStageGraph(const uint8_t* image_device) {
++  image_device = FirstStageInput(image_device, gray_image_device_.get());
++  const int mwbd = tag_detector_->qtp.min_white_black_diff;
++  if (first_stage_exec_) cudaGraphExecDestroy(first_stage_exec_);
++  first_stage_exec_ = nullptr;
++  first_stage_failed_ = true;  // until it works
++  const size_t decimated_width = width_ / 2;
++  const size_t decimated_height = height_ / 2;
++  // The same steps, in the same order, as Detect() launches them one by one.
++  cudaError_t e = cudaStreamBeginCapture(stream_.get(), cudaStreamCaptureModeThreadLocal);
++  if (e != cudaSuccess) {
++    cudaGetLastError();
++    return absl::UnknownError(std::string("starting the first-stage graph failed: ") +
++                              cudaGetErrorString(e));
++  }
++  union_markers_size_device_.MemsetAsync(0u, &stream_);
++  threshold_->ThresholdAndDecimate(image_device, decimated_image_device_.get(),
++                                   thresholded_image_device_.get(), mwbd, &stream_);
++  LabelImage(ToGpuImage(thresholded_image_device_), ToGpuImage(union_markers_device_),
++             ToGpuImage(union_markers_size_device_), stream_.get());
++  num_compressed_union_marker_pair_device_.MemsetAsync(0, &stream_);
++  BlobDiffCompact<kBlobDiffBlockWidth, kBlobDiffBlockHeight>
++      <<<BlobDiffBlocks(decimated_width, decimated_height),
++         dim3(kBlobDiffBlockWidth, kBlobDiffBlockHeight, 1), 0, stream_.get()>>>(
++          thresholded_image_device_.get(), union_markers_device_.get(),
++          union_markers_size_device_.get(), compressed_union_marker_pair_device_.get(),
++          num_compressed_union_marker_pair_device_.get(), decimated_width, decimated_height);
++  num_compressed_union_marker_pair_device_.MemcpyAsyncTo(
++      &num_compressed_union_marker_pair_host_, &stream_);
++  cudaGraph_t graph = nullptr;
++  e = cudaStreamEndCapture(stream_.get(), &graph);
++  if (e != cudaSuccess || !graph) {
++    cudaGetLastError();
++    return absl::UnknownError(std::string("recording the first-stage graph failed: ") +
++                              cudaGetErrorString(e));
++  }
++  e = cudaGraphInstantiate(&first_stage_exec_, graph, 0);
++  cudaGraphDestroy(graph);
++  if (e != cudaSuccess) {
++    cudaGetLastError();
++    first_stage_exec_ = nullptr;
++    return absl::UnknownError(std::string("instantiating the first-stage graph failed: ") +
++                              cudaGetErrorString(e));
++  }
++  first_stage_image_ = image_device;
++  first_stage_mwbd_ = mwbd;
++  first_stage_failed_ = false;
++  return absl::OkStatus();
++}
++
+ absl::Status GpuDetector::Detect(const uint8_t* image,
+                                  const uint8_t* image_device) {
+   // const aos::monotonic_clock::time_point start_time =
+@@ -822,9 +906,16 @@
+ 
+   const bool timing = SpectrumEventTiming();
+   const bool fused = SpectrumFusedBlobDiff();
+-
+-  union_markers_size_device_.MemsetAsync(0u, &memset_stream_);
+-  after_memset_.Record(&memset_stream_);
++  // The recorded first-stage graph, when it's for this input (RecordFirstStageGraph).
++  const bool graph = fused && !timing && SpectrumGraphFirstStage() && first_stage_exec_ &&
++                     first_stage_image_ ==
++                         FirstStageInput(image_device, gray_image_device_.get()) &&
++                     first_stage_mwbd_ == tag_detector_->qtp.min_white_black_diff;
++
++  if (!graph) {
++    union_markers_size_device_.MemsetAsync(0u, &memset_stream_);
++    after_memset_.Record(&memset_stream_);
++  }
+ 
+   // Threshold the image.
+   if (timing) start_.Record(&stream_);
+@@ -841,6 +932,11 @@
+   }
+   if (timing) after_image_memcpy_to_device_.Record(&stream_);
+ 
++  if (graph) {
++    gray_image_host_ptr_ = image;
++    CHECK_CUDA(cudaGraphLaunch(first_stage_exec_, stream_.get()));
++  } else {
++
+   // Now, threshold on the GPU fully.
+   threshold_->ThresholdAndDecimate(image_device, decimated_image_device_.get(),
+                                    thresholded_image_device_.get(),
+@@ -952,9 +1048,11 @@
+ 
+   if (timing) after_compact_.Record(&stream_);
+ 
++  num_compressed_union_marker_pair_device_.MemcpyAsyncTo(
++      &num_compressed_union_marker_pair_host_, &stream_);
++  }  // !graph (the recorded graph ends with the same copy)
++
+   {
+-    num_compressed_union_marker_pair_device_.MemcpyAsyncTo(
+-        &num_compressed_union_marker_pair_host_, &stream_);
+     if (static_cast<size_t>(*num_compressed_union_marker_pair_host_.get()) >=
+         union_marker_pair_device_.size()) {
+       return absl::UnknownError(
+--- a/third_party/971apriltag/apriltag.h
++++ b/third_party/971apriltag/apriltag.h
+@@ -100,6 +100,14 @@
+   // Detects april tags in the provided image.
+   absl::Status Detect(const uint8_t* image, const uint8_t* image_device);
+ 
++  // SpectrumJetson: the fixed-size first stage (threshold, labeling, BlobDiffCompact, and the
++  // point count to the host) as one CUDA graph. Detect() launches it once recorded, and never
++  // records it: stream capture breaks CUDA calls on other threads that aren't allowed during a
++  // capture (the legacy stream, cudaFree, EGL registration), so the caller records it while no
++  // other thread uses CUDA. image_device: what Detect() will get (nullptr: a host image).
++  bool FirstStageGraphWanted(const uint8_t* image_device);
++  absl::Status RecordFirstStageGraph(const uint8_t* image_device);
++
+   const std::vector<QuadCorners>& FitQuads() const;
+ 
+   const zarray_t* Detections() const { return detections_; }
+@@ -389,6 +397,12 @@
+   // True if this is the first detection.
+   bool first_ = true;
+ 
++  // SpectrumJetson: FirstStageGraph's graph, and what it was recorded for.
++  cudaGraphExec_t first_stage_exec_ = nullptr;
++  const uint8_t* first_stage_image_ = nullptr;
++  int first_stage_mwbd_ = -1;
++  bool first_stage_failed_ = false;  // recording failed: don't try again (this detector)
++
+   // Cached quantities used for tag filtering.
+   bool normal_border_ = false;
+   bool reversed_border_ = false;

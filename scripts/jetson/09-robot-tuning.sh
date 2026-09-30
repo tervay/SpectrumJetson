@@ -28,6 +28,13 @@
 #                               reset) holds up every other camera on its hub while the kernel
 #                               retries it: ~65 s each with the default 5 s timeout. 1 s cuts that
 #                               to seconds. A healthy device answers in milliseconds.
+#  11. Drop vanished peers    - TCP gives up on a peer that stopped answering after ~13 s
+#                               (tcp_retries2 5) instead of ~15 min (15). A dashboard whose laptop
+#                               left without closing (lid shut, cable pulled, Wi-Fi gone, driver
+#                               station swapped) kept its camera streams "watched", so PhotonVision
+#                               kept resizing and encoding frames for nobody. Also applies to NT
+#                               (reconnects by itself) and SSH (a >13 s outage with data waiting
+#                               drops the session).
 #
 # Usage: [FAN=quiet|full] 09-robot-tuning.sh [--undo]   (FAN defaults to quiet)
 set -euo pipefail
@@ -45,6 +52,7 @@ PANIC_CONF=/etc/sysctl.d/90-spectrum-panic.conf
 PV_RESTART_CONF=/etc/systemd/system/photonvision.service.d/90-spectrum-restart.conf
 PV_OPENCV_CONF=/etc/systemd/system/photonvision.service.d/90-spectrum-opencv.conf
 USB_TMPFILES=/etc/tmpfiles.d/90-spectrum-usb.conf
+TCP_CONF=/etc/sysctl.d/90-spectrum-tcp.conf
 FAN=${FAN:-quiet}
 [[ $FAN == quiet || $FAN == full ]] || { echo "FAN must be quiet or full, not $FAN" >&2; exit 2; }
 if [[ $FAN == full ]]; then CLOCKS_ARGS="--fan"; else CLOCKS_ARGS=""; fi
@@ -54,6 +62,8 @@ sudo -n true 2>/dev/null || sudo -v   # ask for the password only if sudo needs 
 if [[ ${1:-} == --undo ]]; then
   sudo rm -f "$APT_CONF" "$UDEV_RULE" "$SYSCTL_CONF" "$JOURNALD_CONF"
   sudo rm -f "$WATCHDOG_CONF" "$PANIC_CONF" "$PV_RESTART_CONF" "$PV_OPENCV_CONF" "$USB_TMPFILES"
+  sudo rm -f "$TCP_CONF"
+  sudo sysctl -q net.ipv4.tcp_retries2=15
   echo 5000 | sudo tee /sys/module/usbcore/parameters/initial_descriptor_timeout >/dev/null
   sudo sysctl -q kernel.panic=0
   sudo systemctl daemon-reexec
@@ -211,6 +221,17 @@ w /sys/module/usbcore/parameters/initial_descriptor_timeout - - - - 1000
 CONF
 sudo systemd-tmpfiles --create "$USB_TMPFILES"
 
+echo "==> 11. TCP gives up on a vanished peer after ~13 s, not ~15 min"
+sudo tee "$TCP_CONF" >/dev/null <<'CONF'
+# SpectrumJetson: retransmissions before TCP gives up on a peer that stopped answering. With data
+# queued (a camera stream), the default 15 took ~15 minutes, and a dashboard whose laptop simply
+# left kept its streams "watched" and encoded all that time. 5 gives up after ~13 s (RTO 0.2 s
+# doubling). NT reconnects by itself; an SSH session dies if the network is out >13 s with data
+# waiting.
+net.ipv4.tcp_retries2 = 5
+CONF
+sudo sysctl -q --load "$TCP_CONF"
+
 echo
 echo "Summary:"
 # (|| true: systemctl is-enabled exits non-zero for disabled/masked units, which is the goal.)
@@ -229,5 +250,6 @@ fan=$(cat /sys/devices/platform/pwm-fan*/hwmon/hwmon*/pwm1 2>/dev/null | head -1
 echo "  fan: pwm ${fan:-?}/255, nvfancontrol $(systemctl is-active nvfancontrol 2>&1 || true)"
 echo "  watchdog: $(systemctl show -p RuntimeWatchdogUSec --value) (rebooting: $(systemctl show -p RebootWatchdogUSec --value)), kernel.panic=$(sysctl -n kernel.panic)"
 echo "  USB descriptor timeout: $(cat /sys/module/usbcore/parameters/initial_descriptor_timeout) ms"
+echo "  TCP retries before giving up: $(sysctl -n net.ipv4.tcp_retries2) (~13 s at 5)"
 echo "  photonvision: Restart=$(systemctl show photonvision -p Restart --value), $(systemctl show photonvision -p Environment --value | tr ' ' '\n' | grep -c OPENCV_THREAD_POOL) OpenCV pool settings"
 echo "Reboot to apply the boot changes: sudo reboot"

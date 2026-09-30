@@ -1,0 +1,30 @@
+--- a/drivers/media/usb/uvc/uvc_video.c	2026-09-30 07:27:02.602928500 +0000
++++ b/drivers/media/usb/uvc/uvc_video.c	2026-09-30 07:27:02.626929489 +0000
+@@ -1775,6 +1775,18 @@
+  *
+  * Return the number of allocated packets on success or 0 when out of memory.
+  */
++/*
++ * SpectrumJetson: packets per isochronous URB (0 = the stock UVC_MAX_PACKETS, 32).
++ * The driver sees a URB's packets only when the whole URB completes, so with 32
++ * packets of 125 us a frame's last packet waits up to 4 ms (2 ms on average)
++ * before the frame is handed over, and first-packet timestamps land on 4 ms
++ * steps. Fewer packets per URB: lower latency, more (small) interrupts.
++ * Writable at run time (root): applies when a camera next starts streaming.
++ */
++static unsigned int uvc_urb_packets;
++module_param_named(urb_packets, uvc_urb_packets, uint, 0644);
++MODULE_PARM_DESC(urb_packets, "Packets per isochronous URB (0 = 32, the stock size)");
++
+ static int uvc_alloc_urb_buffers(struct uvc_streaming *stream,
+ 	unsigned int size, unsigned int psize, gfp_t gfp_flags)
+ {
+@@ -1791,6 +1803,8 @@
+ 	npackets = DIV_ROUND_UP(size, psize);
+ 	if (npackets > UVC_MAX_PACKETS)
+ 		npackets = UVC_MAX_PACKETS;
++	if (uvc_urb_packets && npackets > uvc_urb_packets)
++		npackets = uvc_urb_packets;
+ 
+ 	/* Retry allocations until one succeed. */
+ 	for (; npackets > 1; npackets /= 2) {

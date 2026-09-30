@@ -12,7 +12,9 @@
 #
 # The patch (kernel/uvcvideo-payload-cap.patch) adds one module parameter,
 #   payload_cap=vid:pid:bytes[,vid:pid:bytes...]
-# and changes nothing for cameras not listed. Built from the exact stock source of the running
+# and changes nothing for cameras not listed. kernel/uvcvideo-urb-packets.patch adds urb_packets
+# (packets per isochronous URB; 0 = the stock 32; set to 16, URB_PACKETS overrides). The install
+# also sets the stock hwtimestamps option (frames stamped by the camera clock). Built from the exact stock source of the running
 # kernel, verified by matching the installed driver's srcversion before patching.
 #
 # Usage:
@@ -47,7 +49,8 @@ reload() {
 }
 
 if [[ ${1:-} == --undo ]]; then
-  sudo rm -f "$DEST" "$CONF"
+  # The stock driver has no urb_packets (or payload_cap); hwtimestamps it has, so that stays.
+  sudo rm -f "$DEST" "$CONF" /etc/modprobe.d/92-spectrum-uvcvideo-urb-packets.conf
   sudo depmod -a
   reload
   exit 0
@@ -83,9 +86,13 @@ echo "==> Stock source matches the installed driver (srcversion $stock_src)"
 rm -rf "$W/patched" && cp -r "$W/stock" "$W/patched"
 (cd "$W/patched" && make -s -C "/lib/modules/$KVER/build" M="$PWD" clean >/dev/null 2>&1 || true)
 patch -s -d "$W/patched" -p5 < "$REPO_ROOT/kernel/uvcvideo-payload-cap.patch"
+# urb_packets: packets per isochronous URB (kernel/uvcvideo-urb-packets.patch; 0 = stock 32).
+patch -s -d "$W/patched" -p5 < "$REPO_ROOT/kernel/uvcvideo-urb-packets.patch"
 make -s -C "/lib/modules/$KVER/build" M="$W/patched" CONFIG_USB_VIDEO_CLASS=m modules
-modinfo "$W/patched/uvcvideo.ko" | grep -q "^parm:.*payload_cap" \
-  || { echo "Patched driver has no payload_cap parameter?" >&2; exit 1; }
+for parm in payload_cap urb_packets; do
+  modinfo "$W/patched/uvcvideo.ko" | grep -q "^parm:.*$parm" \
+    || { echo "Patched driver has no $parm parameter?" >&2; exit 1; }
+done
 echo "==> Built $W/patched/uvcvideo.ko (vermagic $(modinfo -F vermagic "$W/patched/uvcvideo.ko"))"
 
 [[ ${1:-} == --install ]] || { echo "Build only. Install with: $0 --install"; exit 0; }
@@ -97,5 +104,15 @@ ports=$(sed -n 's/^options uvcvideo payload_cap=//p' "$CONF" 2>/dev/null | tr ',
 sudo install -D -m 644 "$W/patched/uvcvideo.ko" "$DEST"
 printf '# SpectrumJetson: cap USB bandwidth reservations (scripts/jetson/11-uvcvideo-payload-cap.sh)\noptions uvcvideo payload_cap=%s\n' "$CAP" \
   | sudo tee "$CONF" >/dev/null
+# Frames timestamped with the camera's clock (its UVC PTS, through the SCR) instead of the first
+# USB packet's arrival: robot-side jitter 0.95 ms -> 0.01 ms (tests/fake-robot/timestamps.sh). The
+# stock driver has this option too; its own file so the Camera Matching page never rewrites it.
+printf '# SpectrumJetson: timestamp frames with the camera clock (scripts/jetson/11-uvcvideo-payload-cap.sh)\noptions uvcvideo hwtimestamps=1\n' \
+  | sudo tee /etc/modprobe.d/91-spectrum-uvcvideo-timestamps.conf >/dev/null
+# 16 packets per isochronous URB instead of 32 (kernel/uvcvideo-urb-packets.patch): the driver sees
+# a frame's last packet up to 2 ms sooner. Latency 12.98 -> 11.76 ms at the result, 5 cameras;
+# ~0.1 core more (kernel), +2,400 interrupts/s. 8 gained only 0.15 ms more for more CPU.
+printf '# SpectrumJetson: 16 packets per URB, 1.2 ms lower latency (scripts/jetson/11-uvcvideo-payload-cap.sh)\noptions uvcvideo urb_packets=%s\n' "${URB_PACKETS:-16}" \
+  | sudo tee /etc/modprobe.d/92-spectrum-uvcvideo-urb-packets.conf >/dev/null
 sudo depmod -a
 reload

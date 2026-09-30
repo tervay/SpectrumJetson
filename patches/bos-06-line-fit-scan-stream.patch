@@ -1,0 +1,17 @@
+--- a/third_party/971apriltag/apriltag.cc
++++ b/third_party/971apriltag/apriltag.cc
+@@ -1258,10 +1258,13 @@
+     // post-selected values.
+     size_t temp_storage_bytes = temp_storage_line_fit_scan_device_.size();
+ 
++    // SpectrumJetson (bos-06): on this detector's stream. Without a stream argument it ran on
++    // CUDA's legacy default stream, which waits for, and holds up, every other blocking stream in
++    // the process: each camera's line-fit scan waited on the other cameras' GPU work.
+     CHECK_CUDA(cub::DeviceScan::InclusiveScanByKey(
+         temp_storage_line_fit_scan_device_.get(), temp_storage_bytes,
+         key_iterator, input_iterator, line_fit_points_device_.get(), sum_points,
+-        num_selected_blobs_host));
++        num_selected_blobs_host, ::cuda::std::equal_to<>{}, stream_.get()));
+ 
+     MaybeCheckAndSynchronize("cub::DeviceScan::InclusiveScanByKey");
+   }

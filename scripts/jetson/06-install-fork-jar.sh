@@ -44,6 +44,10 @@ ExecStart=
 ExecStart=$JAVA17 -Xmx512m -XX:-CreateCoredumpOnCrash -jar $DEST$NET_FLAG
 EOF
 
+# The Match ready page (photonvision-52) runs the health check through this link, so it's always
+# the repo's current copy.
+sudo ln -sfn "$(cd "$(dirname "$0")" && pwd)/health-check.sh" /opt/photonvision/health-check.sh
+
 sudo systemctl daemon-reload
 sudo systemctl start photonvision
 sleep 10

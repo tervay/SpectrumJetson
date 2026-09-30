@@ -1,0 +1,142 @@
+diff --git a/photon-client/src/components/common/pv-input.vue b/photon-client/src/components/common/pv-input.vue
+index 4285585a..c11e9366 100644
+--- a/photon-client/src/components/common/pv-input.vue
++++ b/photon-client/src/components/common/pv-input.vue
+@@ -42,7 +42,7 @@ const handleKeydown = ({ key }) => {
+ // TODO: fix error text theming
+ </script>
+ <template>
+-  <div class="d-flex">
++  <div class="d-flex" data-pv-control="input" :data-pv-label="label">
+     <v-col :cols="labelCols || 12 - inputCols" class="d-flex align-center pl-0 pt-10px pb-10px">
+       <tooltipped-label :tooltip="tooltip" :label="label" />
+     </v-col>
+diff --git a/photon-client/src/components/common/pv-number-input.vue b/photon-client/src/components/common/pv-number-input.vue
+index babfedd8..fe5ad81c 100644
+--- a/photon-client/src/components/common/pv-number-input.vue
++++ b/photon-client/src/components/common/pv-number-input.vue
+@@ -27,7 +27,7 @@ const localValue = computed({
+ </script>
+ 
+ <template>
+-  <div class="d-flex">
++  <div class="d-flex" data-pv-control="number" :data-pv-label="label">
+     <v-col :cols="labelCols" class="d-flex pl-0 pt-10px pb-10px align-center">
+       <tooltipped-label :tooltip="tooltip" :label="label" />
+     </v-col>
+diff --git a/photon-client/src/components/common/pv-radio.vue b/photon-client/src/components/common/pv-radio.vue
+index f2fe1804..f62a6136 100644
+--- a/photon-client/src/components/common/pv-radio.vue
++++ b/photon-client/src/components/common/pv-radio.vue
+@@ -20,7 +20,7 @@ withDefaults(
+ </script>
+ 
+ <template>
+-  <div class="d-flex">
++  <div class="d-flex" data-pv-control="radio" :data-pv-label="label">
+     <v-col :cols="12 - inputCols" class="d-flex align-center pl-0 pt-10px pb-10px">
+       <tooltipped-label :tooltip="tooltip" :label="label" />
+     </v-col>
+diff --git a/photon-client/src/components/common/pv-range-slider.vue b/photon-client/src/components/common/pv-range-slider.vue
+index 08ec0de9..b2d6ce66 100644
+--- a/photon-client/src/components/common/pv-range-slider.vue
++++ b/photon-client/src/components/common/pv-range-slider.vue
+@@ -55,7 +55,7 @@ const checkNumberRange = (v: string): boolean => {
+ </script>
+ 
+ <template>
+-  <div class="d-flex">
++  <div class="d-flex" data-pv-control="range" :data-pv-label="label" :data-pv-min="min" :data-pv-max="max" :data-pv-step="step">
+     <v-col :cols="12 - sliderCols" class="d-flex align-center pl-0">
+       <tooltipped-label :tooltip="tooltip" :label="label" />
+     </v-col>
+diff --git a/photon-client/src/components/common/pv-select.vue b/photon-client/src/components/common/pv-select.vue
+index 2f7bd9e8..aadfad6b 100644
+--- a/photon-client/src/components/common/pv-select.vue
++++ b/photon-client/src/components/common/pv-select.vue
+@@ -39,7 +39,7 @@ const items = computed<SelectItem[]>(() => {
+ </script>
+ 
+ <template>
+-  <div class="d-flex">
++  <div class="d-flex" data-pv-control="select" :data-pv-label="label">
+     <v-col :cols="12 - selectCols" class="d-flex align-center pl-0 pt-10px pb-10px">
+       <tooltipped-label :tooltip="tooltip" :label="label" />
+     </v-col>
+diff --git a/photon-client/src/components/common/pv-slider.vue b/photon-client/src/components/common/pv-slider.vue
+index 4503f8cc..77da96cf 100644
+--- a/photon-client/src/components/common/pv-slider.vue
++++ b/photon-client/src/components/common/pv-slider.vue
+@@ -43,7 +43,7 @@ const localValue = computed({
+ </script>
+ 
+ <template>
+-  <div class="d-flex">
++  <div class="d-flex" data-pv-control="slider" :data-pv-label="label" :data-pv-min="min" :data-pv-max="max" :data-pv-step="step">
+     <v-col :cols="12 - sliderCols" class="pl-0 pt-10px pb-10px d-flex align-center">
+       <tooltipped-label :tooltip="tooltip" :label="label" />
+     </v-col>
+diff --git a/photon-client/src/components/common/pv-switch.vue b/photon-client/src/components/common/pv-switch.vue
+index 137f22b0..901299bf 100644
+--- a/photon-client/src/components/common/pv-switch.vue
++++ b/photon-client/src/components/common/pv-switch.vue
+@@ -9,7 +9,7 @@ withDefaults(
+ </script>
+ 
+ <template>
+-  <div class="d-flex">
++  <div class="d-flex" data-pv-control="switch" :data-pv-label="label">
+     <v-col :cols="12 - switchCols || labelCols" class="d-flex align-center pl-0">
+       <tooltipped-label :tooltip="tooltip" :label="label" />
+     </v-col>
+diff --git a/photon-server/src/main/java/org/photonvision/server/RequestHandler.java b/photon-server/src/main/java/org/photonvision/server/RequestHandler.java
+index c46333ad..be0710f7 100644
+--- a/photon-server/src/main/java/org/photonvision/server/RequestHandler.java
++++ b/photon-server/src/main/java/org/photonvision/server/RequestHandler.java
+@@ -475,6 +475,33 @@ public class RequestHandler {
+      * POST /api/settings/copySettings {fromCamera, fromPipeline, toCamera, toPipeline, groups}: copies
+      * the chosen groups (camera, resolution, apriltag, output, objectDetection) of settings.
+      */
++    /**
++     * The backend's own copy of what each camera's dashboard shows (current pipeline and its
++     * settings), so tests/ui can check a control really changed the backend, not only the page.
++     * Read-only. SpectrumJetson (45).
++     */
++    public static void onUiStateRequest(Context ctx) {
++        var cameras = new ArrayList<Map<String, Object>>();
++        for (var module : VisionSourceManager.getInstance().vmm.getModules()) {
++            var ui = module.toUICameraConfig();
++            var camera = new HashMap<String, Object>();
++            camera.put("uniqueName", ui.uniqueName);
++            camera.put("nickname", ui.nickname);
++            camera.put("currentPipelineIndex", ui.currentPipelineIndex);
++            camera.put("pipelineNicknames", ui.pipelineNicknames);
++            camera.put("currentPipelineSettings", ui.currentPipelineSettings);
++            camera.put("extraControls", ui.extraControls);
++            cameras.add(camera);
++        }
++        try {
++            ctx.contentType("application/json");
++            ctx.result(kObjectMapper.writeValueAsString(Map.of("cameras", cameras)));
++        } catch (JsonProcessingException e) {
++            ctx.status(500);
++            ctx.result("Could not serialize the camera settings: " + e.getMessage());
++        }
++    }
++
+     public static void onCopySettingsRequest(Context ctx) {
+         CopySettingsRequest req;
+         try {
+diff --git a/photon-server/src/main/java/org/photonvision/server/Server.java b/photon-server/src/main/java/org/photonvision/server/Server.java
+index bde2a7b0..e8a218fd 100644
+--- a/photon-server/src/main/java/org/photonvision/server/Server.java
++++ b/photon-server/src/main/java/org/photonvision/server/Server.java
+@@ -130,6 +130,8 @@ public class Server {
+         app.get("/api/settings/radios", RequestHandler::onRadioStatusRequest);
+         app.post("/api/settings/radios", RequestHandler::onRadioSetRequest);
+         app.post("/api/settings/copySettings", RequestHandler::onCopySettingsRequest); // SpectrumJetson
++        // Read-only view of what each camera's dashboard shows, for tests/ui (SpectrumJetson 45)
++        app.get("/api/spectrum/uiState", RequestHandler::onUiStateRequest);
+         app.get("/api/excludedTags", RequestHandler::onExcludedTagsRequest); // SpectrumJetson
+         app.post("/api/excludedTags", RequestHandler::onExcludedTagsSetRequest);
+         app.get("/api/rewind", RequestHandler::onRewindStatusRequest);

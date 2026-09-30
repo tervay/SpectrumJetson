@@ -37,10 +37,12 @@ add_subdirectory(${BOS_DIR}/third_party/abseil-cpp abseil EXCLUDE_FROM_ALL)
 add_subdirectory(${BOS_DIR}/third_party/971apriltag 971apriltag EXCLUDE_FROM_ALL)
 
 find_package(JNI REQUIRED)
-find_package(OpenCV REQUIRED core)
+# Headers only in lib971apriltag.so (PhotonVision's JVM has its own OpenCV); imgproc for the far
+# search's bench test, a separate program.
+find_package(OpenCV REQUIRED core imgproc)
 find_package(JPEG REQUIRED)  # libjpeg-turbo (libjpeg-turbo8-dev), for decodeMjpegGray
 
-add_library(971apriltag_jni SHARED GpuDetectorJNI.cc fault_kernel.cu)
+add_library(971apriltag_jni SHARED GpuDetectorJNI.cc far_search.cc fault_kernel.cu)
 set_target_properties(971apriltag_jni PROPERTIES OUTPUT_NAME 971apriltag)
 target_include_directories(971apriltag_jni PRIVATE ${BOS_DIR} ${JNI_INCLUDE_DIRS}
                                                    ${OpenCV_INCLUDE_DIRS})
@@ -94,3 +96,17 @@ add_executable(fieldcal_detect fieldcal_detect.cc)
 target_include_directories(fieldcal_detect PRIVATE ${BOS_DIR})
 target_link_libraries(fieldcal_detect PRIVATE 971apriltag absl::flags wpiutil CUDA::cudart JPEG::JPEG
                                               Threads::Threads ${CMAKE_DL_LIBS})
+
+# SpectrumJetson: the far-tag search's bench test (far_search_test.cc): synthetic tags, no camera.
+# tests/far-search/run.sh builds and runs it on the Jetson.
+add_executable(far_search_test far_search_test.cc far_search.cc)
+target_include_directories(far_search_test PRIVATE ${BOS_DIR} ${OpenCV_INCLUDE_DIRS})
+target_link_libraries(far_search_test PRIVATE 971apriltag absl::flags wpiutil CUDA::cudart JPEG::JPEG
+                                              ${OpenCV_LIBS} Threads::Threads ${CMAKE_DL_LIBS})
+
+# SpectrumJetson: far_replay, a whole Rewind session through the detector with the far-tag search
+# deciding as it does live (far_replay.cc). A command-line tool; tests/far-search/replay.sh.
+add_executable(far_replay far_replay.cc far_search.cc)
+target_include_directories(far_replay PRIVATE ${BOS_DIR} ${OpenCV_INCLUDE_DIRS})
+target_link_libraries(far_replay PRIVATE 971apriltag absl::flags wpiutil CUDA::cudart JPEG::JPEG
+                                         ${OpenCV_LIBS} Threads::Threads ${CMAKE_DL_LIBS})

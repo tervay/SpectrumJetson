@@ -1,0 +1,219 @@
+--- b/third_party/971apriltag/apriltag.cc
++++ c/third_party/971apriltag/apriltag.cc
+@@ -40,22 +40,46 @@
+ // context lock, which every camera shares; with 4 cameras at 120 fps the threads convoyed on it
+ // (2026-09-29, docs/TECHNICAL.md). On with VLOG(1), or "1" in /tmp/spectrum-971-event-timing
+ // (re-read every 2 s, for A/B tests).
+-bool SpectrumEventTiming() {
+-  static std::mutex mu;
+-  static std::chrono::steady_clock::time_point next{};
+-  static bool on = false;
+-  std::lock_guard<std::mutex> lock(mu);
+-  const auto now = std::chrono::steady_clock::now();
+-  if (now >= next) {
+-    next = now + std::chrono::seconds(2);
+-    int v = 0;
+-    if (FILE* f = std::fopen("/tmp/spectrum-971-event-timing", "r")) {
+-      if (std::fscanf(f, "%d", &v) != 1) v = 0;
+-      std::fclose(f);
++// An integer switch in a /tmp file, re-read at most every 2 s; `def` when the file is missing.
++class SpectrumKnob {
++ public:
++  SpectrumKnob(const char* path, int def) : path_(path), def_(def), value_(def) {}
++  int Get() {
++    std::lock_guard<std::mutex> lock(mu_);
++    const auto now = std::chrono::steady_clock::now();
++    if (now >= next_) {
++      next_ = now + std::chrono::seconds(2);
++      int v = def_;
++      if (FILE* f = std::fopen(path_, "r")) {
++        if (std::fscanf(f, "%d", &v) != 1) v = def_;
++        std::fclose(f);
++      }
++      value_ = v;
+     }
+-    on = v != 0;
++    return value_;
+   }
+-  return on || VLOG_IS_ON(1);
++
++ private:
++  const char* path_;
++  const int def_;
++  std::mutex mu_;
++  std::chrono::steady_clock::time_point next_{};
++  int value_;
++};
++
++bool SpectrumEventTiming() {
++  static SpectrumKnob knob("/tmp/spectrum-971-event-timing", 0);
++  return knob.Get() != 0 || VLOG_IS_ON(1);
++}
++
++// SpectrumJetson: BlobDiffCompact (below) writes only the boundary points, straight into the
++// compacted array, instead of BlobDiff writing all 4 slots of every pixel (~1M points, 8 MB at
++// 1280x800) and cub::DeviceSelect::If reading them all back to drop the empty ones. Those two
++// were 42% of the detector's GPU time (nsys, 2026-09-29). 971's own TODO asked for this. "0" in
++// /tmp/spectrum-971-fused-blobdiff goes back to BlobDiff + DeviceSelect (re-read every 2 s).
++bool SpectrumFusedBlobDiff() {
++  static SpectrumKnob knob("/tmp/spectrum-971-fused-blobdiff", 1);
++  return knob.Get() != 0;
+ }
+ 
+ typedef std::chrono::duration<float, std::milli> float_milli;
+@@ -381,6 +405,98 @@
+ 
+   DO_CONN(-1, 1, 3);
+ }
++#undef DO_CONN
++
++// SpectrumJetson: BlobDiff, but each block appends only its non-empty points to `result`,
++// counting them in `*num_result` (zeroed before the launch). The same points as BlobDiff followed
++// by DeviceSelect::If(NonZero), in a different order: blocks and threads append as they finish.
++// Nothing downstream depends on the order within a blob pair except the angle sort of the
++// selected points, which now sorts on the whole key (see Detect), so the detections are identical.
++template <size_t kBlockWidth, size_t kBlockHeight>
++__global__ void BlobDiffCompact(const uint8_t* thresholded_image,
++                                const uint32_t* blobs,
++                                const uint32_t* union_markers_size,
++                                QuadBoundaryPoint* result, int* num_result,
++                                apriltag_size_t width, apriltag_size_t height) {
++  __shared__ uint32_t temp_blob_storage[kBlockWidth * kBlockHeight];
++  __shared__ uint8_t temp_image_storage[kBlockWidth * kBlockHeight];
++  __shared__ int block_count;
++  __shared__ int block_base;
++
++  // Every thread reaches both __syncthreads(), so nothing returns early.
++  const uint x = blockIdx.x * (blockDim.x - 2) + threadIdx.x;
++  const uint y = blockIdx.y * (blockDim.y - 1) + threadIdx.y;
++  const bool loaded = x < width && y < height && y != 0;
++  const uint thread_linear_index = threadIdx.x + blockDim.x * threadIdx.y;
++
++  uint32_t rep0 = 0;
++  uint8_t v0 = 127;
++  if (loaded) {
++    rep0 = temp_blob_storage[thread_linear_index] = blobs[x + y * width];
++    v0 = temp_image_storage[thread_linear_index] =
++        thresholded_image[x + y * width];
++  }
++  if (thread_linear_index == 0) block_count = 0;
++  __syncthreads();
++
++  QuadBoundaryPoint points[4];
++  int n = 0;
++  // The same conditions as BlobDiff's returns.
++  if (loaded && threadIdx.x != 0 && threadIdx.x != blockDim.x - 1 &&
++      threadIdx.y != blockDim.y - 1 && x != width - 1 && y != height - 1 &&
++      v0 != 127 && union_markers_size[rep0] >= 25) {
++    uint32_t rep1 = 0;
++    uint8_t v1 = 0;
++    auto conn = [&](int dx, int dy, uint point_offset) {
++      const uint thread_linear_index1 =
++          (threadIdx.x + dx) + blockDim.x * (threadIdx.y + dy);
++      v1 = temp_image_storage[thread_linear_index1];
++      rep1 = temp_blob_storage[thread_linear_index1];
++      if (v0 + v1 == 255 && union_markers_size[rep1] >= 25) {
++        QuadBoundaryPoint cluster_id;
++        if (rep0 < rep1) {
++          cluster_id.set_rep1(rep1);
++          cluster_id.set_rep0(rep0);
++        } else {
++          cluster_id.set_rep1(rep0);
++          cluster_id.set_rep0(rep1);
++        }
++        cluster_id.set_base_xy(x, y);
++        cluster_id.set_dxy(point_offset);
++        cluster_id.set_black_to_white(v1 > v0);
++        points[n++] = cluster_id;
++      }
++    };
++    conn(1, 0, 0);
++    conn(1, 1, 1);
++    conn(0, 1, 2);
++    const uint32_t rep_block_2 = rep1;
++    const uint8_t v1_block_2 = v1;
++
++    const uint left_thread_linear_index1 =
++        threadIdx.x - 1 + blockDim.x * threadIdx.y;
++    const uint8_t v1_block_left = temp_image_storage[left_thread_linear_index1];
++    const uint32_t rep_block_left =
++        temp_blob_storage[left_thread_linear_index1];
++
++    // BlobDiff's dedup: connection 3 repeats the 0-2 connection.
++    const bool duplicate = v1_block_left != 127 && v1_block_2 != 127 &&
++                           v1_block_2 != v1_block_left && x != 1 &&
++                           union_markers_size[rep_block_left] >= 25 &&
++                           union_markers_size[rep_block_2] >= 25;
++    if (!duplicate) conn(-1, 1, 3);
++  }
++
++  const int offset = n > 0 ? atomicAdd(&block_count, n) : 0;
++  __syncthreads();
++  if (thread_linear_index == 0) {
++    block_base = block_count > 0 ? atomicAdd(num_result, block_count) : 0;
++  }
++  __syncthreads();
++  for (int i = 0; i < n; ++i) {
++    result[block_base + offset + i] = points[i];
++  }
++}
+ 
+ // Masks out just the blob ID pair, rep01.
+ struct MaskRep01 {
+@@ -705,6 +821,7 @@
+   //     aos::monotonic_clock::now();
+ 
+   const bool timing = SpectrumEventTiming();
++  const bool fused = SpectrumFusedBlobDiff();
+ 
+   union_markers_size_device_.MemsetAsync(0u, &memset_stream_);
+   after_memset_.Record(&memset_stream_);
+@@ -780,10 +897,22 @@
+           " rows: " + std::to_string(height_));
+     }
+ 
+-    BlobDiff<kBlockWidth, kBlockHeight><<<blocks, threads, 0, stream_.get()>>>(
+-        thresholded_image_device_.get(), union_markers_device_.get(),
+-        union_markers_size_device_.get(), union_marker_pair_device_.get(),
+-        decimated_width, decimated_height);
++    if (fused) {
++      num_compressed_union_marker_pair_device_.MemsetAsync(0, &stream_);
++      BlobDiffCompact<kBlockWidth, kBlockHeight>
++          <<<blocks, threads, 0, stream_.get()>>>(
++              thresholded_image_device_.get(), union_markers_device_.get(),
++              union_markers_size_device_.get(),
++              compressed_union_marker_pair_device_.get(),
++              num_compressed_union_marker_pair_device_.get(), decimated_width,
++              decimated_height);
++      CHECK_CUDA(cudaGetLastError());
++    } else {
++      BlobDiff<kBlockWidth, kBlockHeight><<<blocks, threads, 0, stream_.get()>>>(
++          thresholded_image_device_.get(), union_markers_device_.get(),
++          union_markers_size_device_.get(), union_marker_pair_device_.get(),
++          decimated_width, decimated_height);
++    }
+     MaybeCheckAndSynchronize("BlobDiff");
+   }
+ 
+@@ -792,7 +921,7 @@
+ 
+   if (timing) after_diff_.Record(&stream_);
+ 
+-  {
++  if (!fused) {
+     // Remove empty points which aren't to be considered before sorting to speed
+     // things up.
+     size_t temp_storage_bytes =
+@@ -997,8 +1126,10 @@
+     CHECK_CUDA(cub::DeviceRadixSort::SortKeys(
+         radix_sort_tmpstorage_device_.get(), temp_storage_bytes,
+         selected_blobs_device_.get(), sorted_selected_blobs_device_.get(),
+-        num_selected_blobs_host, decomposer, IndexPoint::kRepEndBit,
+-        IndexPoint::kBitsInKey, stream_.get()));
++        num_selected_blobs_host, decomposer,
++        // SpectrumJetson: the whole key, not just blob and angle (kRepEndBit up), so points at
++        // the same angle keep one order whatever order they arrived in (BlobDiffCompact).
++        0, IndexPoint::kBitsInKey, stream_.get()));
+ 
+     MaybeCheckAndSynchronize("cub::DeviceRadixSort::SortKeys");
+   }

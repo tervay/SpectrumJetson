@@ -274,6 +274,20 @@ int CopyGray(SnjDecoder *d, int fd, uint8_t *gray, int width, int height, size_t
   return Finish(d, "CUDA copy");
 }
 
+// The same, but the Y plane goes into gray_dev (width x height, rows width bytes apart, device
+// memory) first, and from there into gray, so both hold the same pixels.
+int CopyGrayDev(SnjDecoder *d, int fd, uint8_t *gray, int width, int height, size_t stride,
+                uint8_t *gray_dev) {
+  NvBufSurface *surf;
+  Buffer *b;
+  if (int rc = MapBuffer(d, fd, width, height, &surf, &b); rc != SNJ_OK) return rc;
+  cudaMemcpy2DAsync(gray_dev, width, b->frame.frame.pPitch[0], b->frame.pitch, width, height,
+                    cudaMemcpyDeviceToDevice, d->stream);
+  cudaMemcpy2DAsync(gray, stride, gray_dev, width, width, height, cudaMemcpyDeviceToHost,
+                    d->stream);
+  return Finish(d, "CUDA copy");
+}
+
 // Converts libnvjpeg's 4:2:2 planes to BGR on the GPU (nvjpg_bgr.cu), then copies that out.
 int CopyBgr(SnjDecoder *d, int fd, uint8_t *bgr, int width, int height, size_t stride) {
   NvBufSurface *surf;
@@ -362,6 +376,18 @@ SNJ_API int snj_decode_gray(SnjDecoder *d, const uint8_t *jpeg, size_t size, uin
   int fd = -1;
   if (int rc = Decode(d, jpeg, size, width, height, /*bgr=*/false, &fd); rc != SNJ_OK) return rc;
   return CopyGray(d, fd, gray, width, height, stride);
+}
+
+SNJ_API int snj_decode_gray_dev(SnjDecoder *d, const uint8_t *jpeg, size_t size, uint8_t *gray,
+                                int width, int height, size_t stride, uint8_t *gray_dev) {
+  if (!d) return SNJ_BAD_JPEG;
+  if (!jpeg || size < 4 || !gray || !gray_dev || width <= 0 || height <= 0 ||
+      stride < static_cast<size_t>(width)) {
+    return Fail(d, SNJ_BAD_JPEG, "bad arguments");
+  }
+  int fd = -1;
+  if (int rc = Decode(d, jpeg, size, width, height, /*bgr=*/false, &fd); rc != SNJ_OK) return rc;
+  return CopyGrayDev(d, fd, gray, width, height, stride, gray_dev);
 }
 
 SNJ_API int snj_decode_bgr(SnjDecoder *d, const uint8_t *jpeg, size_t size, uint8_t *bgr,

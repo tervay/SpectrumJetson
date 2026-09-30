@@ -36,6 +36,10 @@ void snj_destroy(SnjDecoder *d);
 int snj_decode_gray(SnjDecoder *d, const uint8_t *jpeg, size_t size, uint8_t *gray, int width,
                     int height, size_t stride);
 
+// snj_decode_gray, and the same pixels also left in gray_dev: device memory, width x height, rows
+// width bytes apart (for the CUDA AprilTag detector, which then needn't copy the frame back up).
+int snj_decode_gray_dev(SnjDecoder *d, const uint8_t *jpeg, size_t size, uint8_t *gray, int width,
+                        int height, size_t stride, uint8_t *gray_dev);
 // Decodes a 4:2:2 JPEG to 8-bit BGR (width x height, rows `stride` bytes apart), converting on
 // the GPU (nvjpg_bgr.cu). Identical to libjpeg-turbo's JCS_EXT_BGR with its default settings
 // (what cscore's cv::imdecode produces). Other chroma layouts return SNJ_UNSUPPORTED.

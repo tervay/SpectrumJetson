@@ -16,7 +16,10 @@
 //   end-to-end (nms=True, or YOLO26 nms=False): [1, K, 6], x1 y1 x2 y2 score class
 #include <jni.h>
 
+#include <dlfcn.h>
+
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
@@ -179,12 +182,50 @@ std::vector<Det> Decode(Detector &d, double box_thresh, double nms_thresh, int n
   return dets;
 }
 
+// Holds lib971apriltag.so's CUDA capture lock shared for a scope (GpuDetectorJNI.cc,
+// CudaCaptureLock): that library records CUDA graphs, and while it does, some CUDA calls here
+// (cudaFree, cudaMalloc, engine loading) would break. Does nothing until that library is loaded.
+class CudaShared {
+ public:
+  CudaShared() : unlock_(Fns().unlock) {
+    if (auto lock = Fns().lock) lock();
+  }
+  ~CudaShared() {
+    if (unlock_) unlock_();
+  }
+
+ private:
+  using Fn = void (*)();
+  struct Pair {
+    Fn lock = nullptr, unlock = nullptr;
+  };
+  static Pair Fns() {
+    static std::atomic<bool> found{false};
+    static Pair fns;
+    if (!found.load(std::memory_order_acquire)) {
+      static std::mutex mu;
+      std::lock_guard<std::mutex> l(mu);
+      if (!found.load(std::memory_order_relaxed)) {
+        if (void *h = dlopen("lib971apriltag.so", RTLD_NOLOAD | RTLD_LAZY)) {
+          fns.lock = reinterpret_cast<Fn>(dlsym(h, "spectrum_cuda_lock_shared"));
+          fns.unlock = reinterpret_cast<Fn>(dlsym(h, "spectrum_cuda_unlock_shared"));
+          if (fns.lock && fns.unlock) found.store(true, std::memory_order_release);
+          else fns = Pair{};
+        }
+      }
+    }
+    return found.load(std::memory_order_acquire) ? fns : Pair{};
+  }
+  Fn unlock_;
+};
+
 }  // namespace
 
 extern "C" {
 
 JNIEXPORT jlong JNICALL Java_org_photonvision_jni_TensorRtJNI_create(JNIEnv *env, jclass,
                                                                      jstring jpath) {
+  CudaShared cuda;
   const char *cpath = env->GetStringUTFChars(jpath, nullptr);
   const std::string path(cpath);
   env->ReleaseStringUTFChars(jpath, cpath);
@@ -266,6 +307,7 @@ JNIEXPORT jfloatArray JNICALL Java_org_photonvision_jni_TensorRtJNI_detect(
   auto *mat = reinterpret_cast<cv::Mat *>(mat_ptr);
   if (!d || !mat) return nullptr;
   std::lock_guard<std::mutex> lock(d->mu);
+  CudaShared cuda;
   if (mat->type() != CV_8UC3 || mat->cols != d->in_w || mat->rows != d->in_h ||
       !mat->isContinuous()) {
     std::cout << "TensorRT: need a continuous " << d->in_w << "x" << d->in_h
@@ -320,6 +362,7 @@ JNIEXPORT jfloatArray JNICALL Java_org_photonvision_jni_TensorRtJNI_detect(
 }
 
 JNIEXPORT void JNICALL Java_org_photonvision_jni_TensorRtJNI_destroy(JNIEnv *, jclass, jlong ptr) {
+  CudaShared cuda;
   delete reinterpret_cast<Detector *>(ptr);
 }
 

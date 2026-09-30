@@ -190,7 +190,8 @@ udt=$(cat /sys/module/usbcore/parameters/initial_descriptor_timeout 2>/dev/null 
 [[ $udt == 1000 ]] || warn "USB retries time out after $udt ms, not 1000 (rerun 09-robot-tuning.sh)"
 # USB bandwidth and connection trouble in the last 10 minutes, with what to do about it
 # (usb-bandwidth.py: each camera's reservation, what failed, and the fix).
-UB=$(dirname "$0")/usb-bandwidth.py
+# readlink: also run through /opt/photonvision/health-check.sh (the Match ready page, photonvision-52)
+UB=$(dirname "$(readlink -f "$0")")/usb-bandwidth.py
 if [[ -x $UB ]]; then
   ub=$(python3 "$UB" --json 2>/dev/null || true)
   if [[ -n $ub ]]; then
@@ -206,6 +207,19 @@ PY
   fi
 fi
 
+# photonvision-54: how each camera's tags look (only when a tag is close enough to measure).
+contrast=$(timeout 5 python3 -c '
+import json, urllib.request
+for cam, t in json.load(urllib.request.urlopen("http://localhost:5800/api/tagContrast", timeout=3)).items():
+    if t["verdict"] == "no tags": continue
+    line = "%s tags: white %s, black %s (contrast %s), %s%% clipped: %s" % (cam, t["white"], t["black"], t["contrast"], t["clipped"], t["verdict"])
+    print(("PASS\t" if t["verdict"] == "good" else "WARN\t") + line + ("" if t["verdict"] == "good" else ". " + t["advice"]))
+' 2>/dev/null || true)
+while IFS= read -r l; do
+  [[ -z $l ]] && continue
+  case ${l%%$'\t'*} in PASS) pass "${l#*$'\t'}" ;; WARN) warn "${l#*$'\t'}" ;; esac
+done <<<"$contrast"
+
 echo "== Robot connection"
 last_nt=$(grep -E "NT connected to|Could not connect to the robot|disconnected" <<<"$LOG" | tail -1)
 team=$(grep -m1 -oE "server team is [0-9]+|server IP is [^ ]+" <<<"$LOG")
@@ -216,6 +230,63 @@ if grep -q "NT connected to" <<<"$last_nt"; then
 else
   warn "not connected to the robot (${team:-no team set}); expected off the robot"
 fi
+# Camera-clock timestamps (uvcvideo hwtimestamps=1): 0.01 ms jitter instead of 0.95 ms.
+if [[ $(cat /sys/module/uvcvideo/parameters/hwtimestamps 2>/dev/null) == 1 ]]; then
+  pass "frames timestamped by the camera clock (uvcvideo hwtimestamps)"
+else
+  warn "frames timestamped on USB arrival (~1 ms jitter): 11-uvcvideo-payload-cap.sh --install sets hwtimestamps=1"
+fi
+# A driver setting changed live but not saved is lost at the next boot (a 5th camera's 1280-byte
+# cap set by hand once reverted to 256 that way). Compare each live value with modprobe.d.
+for parm in payload_cap hwtimestamps urb_packets; do
+  live=$(cat /sys/module/uvcvideo/parameters/$parm 2>/dev/null) || continue
+  saved=$(cat /etc/modprobe.d/9*-spectrum-uvcvideo*.conf 2>/dev/null | sed -n "s/^options uvcvideo .*$parm=\([^ ]*\).*/\1/p" | tail -1)
+  default=$([[ $parm == payload_cap ]] && echo "" || echo 0)
+  if [[ $live != "${saved:-$default}" ]]; then
+    warn "camera driver $parm is '$live' now but '${saved:-$default}' after a reboot (save it: Camera Matching page for payload_cap, or /etc/modprobe.d)"
+  fi
+done
+urbp=$(cat /sys/module/uvcvideo/parameters/urb_packets 2>/dev/null || echo none)
+case $urbp in
+  16) pass "camera driver hands frames over in 2 ms steps (urb_packets 16)" ;;
+  none) warn "stock camera driver: no payload_cap or urb_packets (11-uvcvideo-payload-cap.sh --install)" ;;
+  *) warn "camera driver urb_packets is $urbp (16 is 1.2 ms lower latency than the stock 32; 11-uvcvideo-payload-cap.sh --install)" ;;
+esac
+# photonvision-49/50: idle mode (30 fps per camera while the robot is disabled) switched off?
+idle=$(timeout 5 python3 -c 'import json,urllib.request; s=json.load(urllib.request.urlopen("http://localhost:5800/api/robotState", timeout=3)); print("on %g" % s["idleFps"] if s["idleWhileDisabled"] else "off")' 2>/dev/null || true)
+case $idle in
+  on*) pass "idle while disabled: ${idle#on } fps per camera" ;;
+  off) warn "idle while disabled is off: cameras run at full speed while the robot is disabled (Settings > Robot state)" ;;
+esac
+# photonvision-55: far-tag search (full-size searches while no camera has a good view).
+far=$(timeout 5 python3 -c 'import json,urllib.request; s=json.load(urllib.request.urlopen("http://localhost:5800/api/robotState", timeout=3)); print("on %g %s" % (s["farSweepsPerSecond"], s.get("farSearchSweeps", "?")) if s["farSearch"] else "off")' 2>/dev/null || true)
+case $far in
+  on*) set -- $far; pass "far-tag search on: up to $2 full-size searches a second while no camera has a good view ($3 so far)" ;;
+  off) echo "        far-tag search off (Settings > Robot state): tags under ~20 px aren't searched for" ;;
+esac
+# photonvision-51: the event pipeline, and what each camera has at that number.
+event=$(timeout 5 python3 - <<'PY' 2>/dev/null || true
+import json, urllib.request
+get = lambda p: json.load(urllib.request.urlopen("http://localhost:5800" + p, timeout=3))
+s = get("/api/robotState")
+if s["eventProfileOnFms"]:
+    n = s["eventPipeline"]
+    cams = get("/api/spectrum/uiState")["cameras"]
+    have = ["%s '%s'" % (c["nickname"], c["pipelineNicknames"][n]) for c in cams if len(c["pipelineNicknames"]) > n]
+    miss = [c["nickname"] for c in cams if len(c["pipelineNicknames"]) <= n]
+    names = {c["pipelineNicknames"][n] for c in cams if len(c["pipelineNicknames"]) > n}
+    line = "event pipeline %d when the field connects: %s" % (n, ", ".join(have))
+    if miss: line += "; no pipeline %d on %s" % (n, ", ".join(miss))
+    print(("WARN\t" if miss or len(names) > 1 else "PASS\t") + line)
+else:
+    print("INFO\tevent pipeline when the field connects: off (Settings > Robot state)")
+PY
+)
+case ${event%%$'\t'*} in
+  PASS) pass "${event#*$'\t'}" ;;
+  WARN) warn "${event#*$'\t'}" ;;
+  INFO) echo "        ${event#*$'\t'}" ;;
+esac
 ips=$(ip -4 -br addr | awk '$1 !~ /^(lo|l4tbr0|usb|docker)/ && $3 != "" {print $1" "$3}' | paste -sd',' | sed 's/,/, /g')
 echo "        addresses: ${ips:-none}"
 if nmcli -t -f DEVICE,TYPE,STATE dev 2>/dev/null | grep -q ":wifi:connected"; then

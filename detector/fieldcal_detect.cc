@@ -4,12 +4,15 @@
 //
 //   fieldcal_detect CAMERA_DIR OUT.csv [--every N] [--calib fx,fy,cx,cy,k1,k2,p1,p2,k3,k4,k5,k6]
 //                   [--mwbd N] [--mse X] [--threads N] [--upscale 2]
+//                   [--mask ignore|only x,y,w,h[;x,y,w,h...]]
 //
 // CAMERA_DIR: one camera's folder of a Rewind session (NNNN.mjpeg + NNNN.csv, docs/REWIND.md).
 // --every N: every Nth frame. --calib: the camera's lens calibration; the detector's edge
 // refinement straightens edges with it, as it does in PhotonVision (without it, no undistortion).
 // --mwbd / --mse: as SPECTRUM_971_MIN_WHITE_BLACK_DIFF / SPECTRUM_971_MAX_LINE_FIT_MSE, which
 // are also read from the environment (defaults 5 and 10, as in GpuDetectorJNI.cc).
+// --mask (bos-07): as PhotonVision's Mask tab. ignore = skip the boxes, only = search only inside
+// them; boxes are fractions of the image. Without --upscale 2 (the mask is at the detector's size).
 // --upscale 2 (experimental, off by default): search at full size. The detector finds quads on a
 // half-size image (quad_decimate 2 is hard-wired), which misses tags under ~20 px; a 2x
 // nearest-neighbour upscale finds them down to ~12 px, at ~2x the GPU time. Corners are scaled
@@ -24,6 +27,7 @@
 // decoders give the detector. Decoding runs on --threads CPU threads (default 5) ahead of the GPU.
 
 #include <algorithm>
+#include <cmath>
 #include <atomic>
 #include <cctype>
 #include <chrono>
@@ -43,6 +47,7 @@
 #include <jpeglib.h>
 
 #include "absl/status/status.h"
+#include "rewind_reader.h"
 #include "apriltag/apriltag.h"
 #include "apriltag/tag36h11.h"
 #include "third_party/971apriltag/apriltag.h"
@@ -51,90 +56,9 @@ namespace fs = std::filesystem;
 
 namespace {
 
-struct Frame {
-  int index;
-  long long jetson_us;
-  fs::path mjpeg;
-  long long offset, size;
-  int width, height;
-};
-
-struct JpegError {
-  jpeg_error_mgr mgr;
-  std::jmp_buf jump;
-};
-void JpegErrorExit(j_common_ptr c) { std::longjmp(reinterpret_cast<JpegError *>(c->err)->jump, 1); }
-void JpegQuiet(j_common_ptr, int) {}
-
-// libjpeg-turbo to 8-bit gray, as GpuDetectorJNI.cc's TurboDecode does. false on a bad JPEG.
-bool DecodeGray(const std::vector<unsigned char> &jpeg, std::vector<uint8_t> &out, int width, int height) {
-  jpeg_decompress_struct c;
-  JpegError err;
-  c.err = jpeg_std_error(&err.mgr);
-  err.mgr.error_exit = JpegErrorExit;
-  err.mgr.emit_message = JpegQuiet;
-  if (setjmp(err.jump)) {
-    jpeg_destroy_decompress(&c);
-    return false;
-  }
-  jpeg_create_decompress(&c);
-  jpeg_mem_src(&c, const_cast<unsigned char *>(jpeg.data()), jpeg.size());
-  if (jpeg_read_header(&c, TRUE) != JPEG_HEADER_OK) {
-    jpeg_destroy_decompress(&c);
-    return false;
-  }
-  c.out_color_space = JCS_GRAYSCALE;
-  c.dct_method = JDCT_ISLOW;
-  jpeg_start_decompress(&c);
-  if (static_cast<int>(c.output_width) != width || static_cast<int>(c.output_height) != height ||
-      c.output_components != 1) {
-    jpeg_abort_decompress(&c);
-    jpeg_destroy_decompress(&c);
-    return false;
-  }
-  out.resize(static_cast<size_t>(width) * height);
-  while (c.output_scanline < c.output_height) {
-    JSAMPROW row = out.data() + static_cast<size_t>(c.output_scanline) * width;
-    jpeg_read_scanlines(&c, &row, 1);
-  }
-  jpeg_finish_decompress(&c);
-  jpeg_destroy_decompress(&c);
-  return true;
-}
-
-// Every frame of a camera folder, in order (the Jetson writes "# frame,offset,size,width,height,
-// jetson_us,robot_us"). A frame past the end of its .mjpeg (recording cut mid-write) ends a segment.
-std::vector<Frame> ReadIndex(const fs::path &dir) {
-  std::vector<fs::path> csvs;
-  for (auto &e : fs::directory_iterator(dir)) {
-    const auto name = e.path().filename().string();
-    if (e.path().extension() == ".csv" && !name.empty() && std::isdigit(static_cast<unsigned char>(name[0])))
-      csvs.push_back(e.path());
-  }
-  std::sort(csvs.begin(), csvs.end());
-  std::vector<Frame> frames;
-  int n = 0;
-  for (const auto &csv : csvs) {
-    fs::path mj = csv;
-    mj.replace_extension(".mjpeg");
-    if (!fs::exists(mj)) continue;
-    const long long length = static_cast<long long>(fs::file_size(mj));
-    std::ifstream in(csv);
-    std::string line;
-    while (std::getline(in, line)) {
-      if (line.empty() || line[0] == '#' || !std::isdigit(static_cast<unsigned char>(line[0]))) continue;
-      std::stringstream ss(line);
-      std::string f[7];
-      for (int i = 0; i < 7 && std::getline(ss, f[i], ','); ++i) {
-      }
-      Frame fr{n++, std::atoll(f[5].c_str()), mj, std::atoll(f[1].c_str()), std::atoll(f[2].c_str()),
-               std::atoi(f[3].c_str()), std::atoi(f[4].c_str())};
-      if (fr.offset + fr.size > length) break;
-      frames.push_back(fr);
-    }
-  }
-  return frames;
-}
+using recording::DecodeGray;
+using recording::Frame;
+using recording::ReadIndex;
 
 double EnvOr(const char *name, double fallback) {
   const char *v = std::getenv(name);
@@ -146,12 +70,15 @@ double EnvOr(const char *name, double fallback) {
 int main(int argc, char **argv) {
   if (argc < 3) {
     std::cerr << "usage: fieldcal_detect CAMERA_DIR OUT.csv [--every N] "
-                 "[--calib fx,fy,cx,cy,k1,k2,p1,p2,k3,k4,k5,k6] [--mwbd N] [--mse X] [--threads N] [--upscale 2]\n";
+                 "[--calib fx,fy,cx,cy,k1,k2,p1,p2,k3,k4,k5,k6] [--mwbd N] [--mse X] [--threads N] [--upscale 2]"
+                 " [--mask ignore|only x,y,w,h[;x,y,w,h...]]\n";
     return 2;
   }
   const fs::path dir = argv[1];
   const std::string out_path = argv[2];
   int every = 1, threads = 5, upscale = 1;
+  int mask_mode = 0;  // 1 ignore inside the boxes, 2 search only inside them
+  std::vector<double> mask_boxes;
   int mwbd = static_cast<int>(EnvOr("SPECTRUM_971_MIN_WHITE_BLACK_DIFF", 5));
   double mse = EnvOr("SPECTRUM_971_MAX_LINE_FIT_MSE", 10.0);
   frc::apriltag::CameraMatrix cam{1, 1, 1, 1};  // with zero distortion: no undistortion
@@ -164,6 +91,22 @@ int main(int argc, char **argv) {
     else if (a == "--threads") threads = std::max(1, std::atoi(v)), ++i;
     else if (a == "--upscale") upscale = std::atoi(v) == 2 ? 2 : 1, ++i;
     else if (a == "--mwbd") mwbd = std::atoi(v), ++i;
+    else if (a == "--mask") {
+      const std::string m = v;
+      mask_mode = m == "ignore" ? 1 : m == "only" ? 2 : 0;
+      std::stringstream ss(i + 2 < argc ? argv[i + 2] : "");
+      std::string t;
+      while (std::getline(ss, t, ';')) {
+        std::stringstream bs(t);
+        std::string c;
+        while (std::getline(bs, c, ',')) mask_boxes.push_back(std::atof(c.c_str()));
+      }
+      if (!mask_mode || mask_boxes.empty() || mask_boxes.size() % 4) {
+        std::cerr << "--mask needs ignore|only and x,y,w,h boxes separated by ';'\n";
+        return 2;
+      }
+      i += 2;
+    }
     else if (a == "--mse") mse = std::atof(v), ++i;
     else if (a == "--calib") {
       double k[12] = {};
@@ -215,6 +158,26 @@ int main(int argc, char **argv) {
   td->debug = false;
   auto *gpu = new frc::apriltag::GpuDetector(dw, dh, td, cam, dist, vision::ImageFormat::MONO8);
   std::vector<uint8_t> big(upscale == 2 ? static_cast<size_t>(dw) * dh : 0);
+  // --mask: the same rasterisation as GpuDetectorJNI.cc's ApplyMaskToDetector, at half size.
+  std::vector<uint8_t> mask_pixels;
+  if (mask_mode) {
+    const int mw = dw / 2, mh = dh / 2;
+    mask_pixels.assign(static_cast<size_t>(mw) * mh, mask_mode == 2 ? 0 : 1);
+    for (size_t r = 0; r + 3 < mask_boxes.size(); r += 4) {
+      const double *b = &mask_boxes[r];
+      const int x0 = std::clamp(static_cast<int>(std::floor(b[0] * mw)), 0, mw);
+      const int y0 = std::clamp(static_cast<int>(std::floor(b[1] * mh)), 0, mh);
+      const int x1 = std::clamp(static_cast<int>(std::ceil((b[0] + b[2]) * mw)), 0, mw);
+      const int y1 = std::clamp(static_cast<int>(std::ceil((b[1] + b[3]) * mh)), 0, mh);
+      for (int y = y0; y < y1; ++y) {
+        std::fill(mask_pixels.begin() + static_cast<size_t>(y) * mw + x0,
+                  mask_pixels.begin() + static_cast<size_t>(y) * mw + x1, mask_mode == 2 ? 1 : 0);
+      }
+    }
+    gpu->SetMask(mask_pixels.data());
+    std::cerr << "mask: " << (mask_mode == 1 ? "ignoring" : "searching only") << " "
+              << mask_boxes.size() / 4 << " box(es)\n";
+  }
 
   // Decode ahead on CPU threads into a ring of slots; the GPU detects in frame order.
   const size_t ring = static_cast<size_t>(threads) * 4;
@@ -222,6 +185,7 @@ int main(int argc, char **argv) {
   std::vector<std::atomic<int>> state(ring);  // 0 free, 1 ready, 2 bad
   for (auto &s : state) s = 0;
   std::atomic<size_t> next{0};
+  std::atomic<size_t> consumed{0};  // frames the detect loop has taken out of the ring
   std::atomic<bool> stop{false};
   std::vector<std::thread> workers;
   for (int t = 0; t < threads; ++t) {
@@ -231,7 +195,11 @@ int main(int argc, char **argv) {
       fs::path open_path;
       for (size_t i = next++; i < frames.size() && !stop; i = next++) {
         const size_t slot = i % ring;
-        while (state[slot] != 0 && !stop) std::this_thread::sleep_for(std::chrono::microseconds(200));
+        // Wait until frame i - ring has been taken, not just until the slot reads free: it also
+        // reads free while another thread is still decoding frame i - ring into it. Then both
+        // threads wrote the slot and one "ready" was lost, and the detect loop waited forever
+        // (seen 2026-09-29 with the CPU busy).
+        while (i >= consumed + ring && !stop) std::this_thread::sleep_for(std::chrono::microseconds(200));
         const Frame &f = frames[i];
         if (open_path != f.mjpeg) {
           file.close();
@@ -264,6 +232,7 @@ int main(int argc, char **argv) {
     if (state[slot] == 2) {
       ++bad;
       state[slot] = 0;
+      ++consumed;
       continue;
     }
     const auto d0 = std::chrono::steady_clock::now();
@@ -277,9 +246,16 @@ int main(int argc, char **argv) {
       }
       img = big.data();
     }
+    // bos-05: one thread here, so the first-stage graph can be recorded right before use.
+    if (gpu->FirstStageGraphWanted(nullptr)) {
+      if (absl::Status r = gpu->RecordFirstStageGraph(nullptr); !r.ok()) {
+        std::cerr << "first-stage graph: " << r.message() << std::endl;
+      }
+    }
     absl::Status st = gpu->Detect(img, nullptr);
     detect_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - d0).count();
     state[slot] = 0;
+    ++consumed;
     if (!st.ok()) {
       ++failed;
       continue;

@@ -176,8 +176,11 @@ PhotonVision 2027.
     complete, no gaps over 45 ms, and no invalid-JPEG warnings. Frames were 48–50 KB median,
     **62 KB max** (73% of what alt 7 carries at 120 fps). A busier scene makes bigger frames; if
     frames approach 85 KB, use `CAP=1bcf:28c5:1984` (alt 9, 3 per port) or put cameras on USB-C.
-  - **Trade-off:** a frame takes longer to cross USB, ~4.9 ms for 50 KB at alt 7 against ~2.0 ms
-    at alt 11, so results reach the robot ~2 ms later. Timestamps aren't affected: the driver
+  - **Trade-off (estimated):** a frame would take longer to cross USB, ~4.9 ms for 50 KB at alt
+    7 against ~2.0 ms at alt 11. **Measured 2026-09-29, it doesn't:** the camera spreads each
+    frame over ~8.1 ms (about one frame period, while its sensor reads out), longer than alt 7
+    needs for a 34 KB frame (3.4 ms), so the cap adds no latency (TECHNICAL.md, "Latency").
+    Timestamps aren't affected: the driver
     stamps a frame when its *first* USB packet arrives, and `photonvision-13` moves that back to
     mid-exposure.
 - **Hardware JPEG decode (NVJPG) works on our Orin Nano, but only one way of calling it gives
@@ -367,6 +370,21 @@ The newest code is [RobotCode2026Public/northstar](https://github.com/Mechanical
 - **Health alerts:** "not on NetworkTables" reported separately from "no frames for 1.5 s".
 - **Game pieces:** a field map where pieces expire after 3 s.
 - **Bumps:** odometry trust scaled down with tilt.
+
+### 3015's Polaris (checked 2026-09-28, nothing to take)
+
+[3015RangerRobotics/polaris](https://github.com/3015rangerrobotics/polaris) is their fork of
+Northstar's 2024-era design. **Low / low.** Don't search it again.
+- **Stack:** Python on Orange Pis, about 45 KB of code, MIT. OpenCV ArUco detection on the CPU,
+  `solvePnPGeneric` (IPPE_SQUARE) for two candidate poses, robotpy to NetworkTables, and an MJPEG
+  stream.
+- **Setup:** `setup.sh` builds OpenCV with GStreamer on each device and installs a systemd
+  service. The image workflow is unfinished ("maybe builds an image").
+- **Missing:** game pieces, health telemetry, camera recovery, logging and replay.
+- **Activity:** last push 2024-04-03. It has 9 saved camera calibrations, so they ran many cheap
+  cameras.
+- **Vs. ours:** a weaker detector than the 971 one on a much slower platform. No performance
+  numbers or field results are published.
 
 ## If we designed the ideal FRC vision system
 

@@ -201,7 +201,7 @@ Swap by installing one to `/usr/lib/lib971apriltag.so` and restarting `photonvis
 | Build | Source | Script | Status |
 |---|---|---|---|
 | **4143 + patches** (fallback) | FRC-Team-4143/GpuDetectorJNI `ef9fc1e` (≈971 code of 2024-08) + `patches/gpudetector-0{1,2,3}` | `05-build-gpudetector.sh` (installs) | Running; leak, handle and stale-error fixes applied |
-| **bos / Austin's current** (**installed**, robot config) | frc971/bos `62e93b4` `third_party/971apriltag` = RealtimeRoboticsGroup/aos `frc/orin` detector as of `8736ba62` (2026-03-30) + 971's `absl::Status` returns + `patches/bos-01`; JNI in `detector/` | `07-build-bos-detector.sh` then `08-select-detector.sh bos --mwbd 20` | A/B tested and fault tested (below) |
+| **bos / Austin's current** (**installed**, robot config) | frc971/bos `62e93b4` `third_party/971apriltag` = RealtimeRoboticsGroup/aos `frc/orin` detector as of `8736ba62` (2026-03-30) + 971's `absl::Status` returns + `patches/bos-01` to `bos-04`; JNI in `detector/` | `07-build-bos-detector.sh` then `08-select-detector.sh bos --mwbd 20` | A/B tested and fault tested (below) |
 
 aos is the upstream source of truth. The only detector change in aos since bos
 imported it (2026-04-03) is `c1c3b4607` (M_PI → std::numbers::pi, cosmetic).
@@ -1035,6 +1035,860 @@ came back.
   `{grid, centre, best, width, height, ageMs}`, and 204 before the first reading. The Camera page's
   Focus card shows each cell against its own best since Reset.
 - **Checked:** TopLeft returned readings about 5 times a second at 1280x800.
+
+### Four Thriftiest Cams: CUDA's lock and per-frame event timing (2026-09-29, `bos-03`)
+
+First run with 4 Thriftiest Cams (TopLeft, TopRight, BottomLeft, BottomRight; all 1280x800 MJPEG at
+122 fps, no tags in view, no dashboard streams, hardware JPEG decode on). PhotonVision used 2.2 cores
+and the GPU sat at 40–45%, against 0.8 cores and 17% on 2026-09-26 (two cameras at 61 fps then).
+
+- **Scaling, unplugging one camera at a time** (same boot, 10 s windows):
+
+  | Cameras | Detect | PhotonVision CPU | Cross-core wakeups (IPI1) | GPU |
+  |---|---|---|---|---|
+  | 1 | 1.45 ms | 0.38 cores | 3,000/s | 7% |
+  | 2 | 1.8 ms | 0.65 | 4,100/s | 13% |
+  | 3 | 2.2 ms | 1.1 | 6,500/s | 22% |
+  | 4 | 4.4 ms | 2.2 | 20,000/s | 40% |
+
+- **Where the CPU went:** more than half was kernel time (1.15 of 2.0 cores), in the 4 camera
+  threads. `ipi:ipi_raise` tracing showed ~40 cross-core wakeups per frame, 82% of them futex
+  handoffs, 44% from priority-inheritance unlocks. The 4 camera threads handed a lock around in
+  strict rotation every 15–20 µs. gdb stacks: one camera thread in `cudaEventSynchronize` →
+  `ioctl` (libnvrm_gpu), the others in `futex_lock_pi` inside `cudaEventSynchronize` and
+  `cudaLaunchKernel`. That is libcuda's context lock, which every camera shares (one CUDA context
+  per process).
+- **Ruled out:** dashboard streams (closed: same load), hardware JPEG decode (off: kernel time
+  −0.2 cores, the wakeups −10%), detector threads (1/2/6: no change), CUDA wait mode (`spin`: no
+  change), a reboot (no change).
+- **The cause:** at the end of every frame, `GpuDetector::Detect()` walked 22 CUDA events, calling
+  `cudaEventSynchronize` and `cudaEventElapsedTime` on each, for a `VLOG(1)` timing report that is
+  never printed. 16 of those events are recorded only for that report. That's ~60 calls per frame
+  that take the shared lock for no result.
+- **The fix, `patches/bos-03-no-per-frame-event-timing.patch`:** the timing-only events are
+  recorded, and the report runs, only with `VLOG(1)` on or `1` in `/tmp/spectrum-971-event-timing`
+  (re-read every 2 s, for A/B tests). The 7 events that are real sync points are unchanged.
+- **Measured live, 4 cameras, alternating 3 times, 10 s each:**
+
+  | | Detect | PhotonVision CPU | Wakeups | GPU |
+  |---|---|---|---|---|
+  | Before (timing on) | 3.08 ms | 1.84 cores | 13,700/s | 36.5% |
+  | **`bos-03`** | **2.19 ms** | **1.48** | 12,000/s | 34.8% |
+  | `bos-03` + GPU lock | 2.14 ms | 1.33 | 10,250/s | 35.6% |
+
+  The same ~0.9 ms came off with 3 cameras (2.77 → 1.89 ms).
+- **GPU lock** (`detector/GpuDetectorJNI.cc`, `SPECTRUM_971_GPU_LOCK=1` or `1` in
+  `/tmp/spectrum-971-gpu-lock`, re-read every 2 s; **off by default**): one camera's `Detect()` at a
+  time, so the cameras queue once per frame instead of on every CUDA call. With `bos-03` it saves
+  another ~0.15 cores and costs no latency; before `bos-03` it saved 0.3 cores but added 0.3 ms.
+  The stats line shows `gpu lock wait` when it's on.
+- **The GPU load is real work.** `nsys profile --trace=cuda` (8 s, 3,866 frames, with `bos-03`):
+  0.65 ms of kernels and 0.13 ms of copies and memsets per frame, 31.6 kernel launches and ~58 CUDA
+  calls in all. 0.78 ms × 483 fps ≈ 37%, what GR3D shows. Two kernels are 42% of it, and both work
+  on the whole image whatever the scene: the first `cub::DeviceSelect::If` (149 µs, compacting the
+  mostly-empty `BlobDiff` output) and `BlobDiff` (121 µs).
+- **Restart-to-restart noise is at least partly the scene.** After the cameras were replugged, the
+  same code without `bos-03` gave 2.8 ms and 1.84 cores instead of 4.4 ms and 2.2. The detector's
+  work after `BlobDiff` depends on how many candidate blobs each camera sees, so where the cameras
+  point matters. Compare configurations in one run, alternating, as above.
+- **Also seen:** TopRight came up at 320x240 after one of the restarts (`health-check.sh` FAIL, one
+  of 4 detectors missing; see `photonvision-27`); another restart fixed it. Check that all 4
+  detectors report before trusting a measurement.
+- **Batching the 4 cameras into one pass was ruled out:** they free-run, so a batch waits up to
+  8 ms for the slowest frame.
+
+#### Fused `BlobDiff` (`bos-04`)
+
+- **What:** `BlobDiffCompact` writes only the boundary points, straight into the compacted
+  array: each block counts its points in shared memory and takes one global `atomicAdd`. It
+  replaces `BlobDiff` writing all 4 slots of every pixel (~1M points, 8 MB at 1280x800) plus
+  `cub::DeviceSelect::If` reading them all back. `0` in `/tmp/spectrum-971-fused-blobdiff`
+  (re-read every 2 s) goes back to the original pair; on by default.
+- **Order:** the points arrive in a different order. The first sort only orders by blob pair
+  (bits 24–63), and nothing after it depends on the order within a pair except the angle sort of
+  the selected points. That sort now uses the whole 64-bit key (blob, angle, then the point's own
+  bits, which are unique), so the result depends only on which points exist.
+- **Checked:** `fieldcal_detect` over the synthetic 4-camera recording and the bench sessions
+  0006–0009 and 0011 (~5,000 frames, 3,567 tag detections): the CSVs are **byte-identical** fused,
+  unfused, and against the Sep 24 build (`bos-01`/`-02` only).
+- **Measured live** (4 cameras, alternating 3 times, 10 s each):
+
+  | | GPU | Detect | PhotonVision CPU |
+  |---|---|---|---|
+  | **Fused** | **28.1%** | **1.88 ms** | 1.43 cores |
+  | Unfused | 35.6% | 2.40 ms | 1.52 |
+
+#### Frames stay on the GPU ("GPU input")
+
+- **What:** with the hardware decoder, each gray frame was decoded on the GPU, copied down into
+  PhotonVision's Mat, then copied back up by `Detect()`. `snj_decode_gray_dev`
+  (`libspectrumnvjpg.so`) now also leaves the Y plane in a per-camera-thread GPU buffer (a GPU to
+  GPU copy; the Mat is filled from it, so both hold the same pixels). `processimage` passes that
+  buffer to `Detect(image, image_device)`, which then skips the upload. The CPU copy is still
+  needed: tag decoding reads it.
+- **Which frame is which:** PhotonVision hands the detector a copy of the decoded Mat
+  (`GrayscalePipe`), so the pointers differ, and a 180° rotation would change the pixels in
+  place. So the GPU copy is used only on the same thread, for a frame of the same size whose 64
+  sampled pixels match the decoded frame's. Every 240 such frames per camera (~2 s), the GPU copy
+  is read back and compared in full. Any difference turns it off until PhotonVision restarts
+  (`971 GPU input: ... DIFFERS`). `0` in `/tmp/spectrum-971-gpu-input` turns it off live. The
+  stats line shows `gpu input N%`; it's 100% on all 4 cameras.
+- **Measured live** (alternating 3 times): detect **1.32 ms** against 1.55, PhotonVision CPU 1.26
+  cores against 1.34, GPU unchanged (27%: the GPU-to-GPU copy replaced the upload). No
+  differences found.
+
+#### Where 4 cameras stand now
+
+| | Detect | PhotonVision CPU | GPU |
+|---|---|---|---|
+| Start (2026-09-29) | 4.4 ms | 2.2 cores | 40–43% |
+| + `bos-03` | 2.2 ms | 1.5 | 35% |
+| + `bos-04` | 1.9 ms | 1.4 | 28% |
+| + GPU input | 1.3 ms | 1.26 | 27% |
+| + first-stage graph (`bos-05`) | 1.2 ms | 1.23 | 25.6% |
+| + `bos-06`, `photonvision-37` (no gray copy); 10 clean restarts | **1.23 ms** | **1.14** | **25.7%** |
+
+Board power 9.9 W at the end, against 11.6 W at the start; tj 54.7 °C (fan on the quiet
+profile).
+
+**With tags in view** (same build, cameras facing up at the shop's ceiling lights, tags held
+above them, every camera seeing every tag on every frame, no streams, 3 × 8 s each):
+
+| Same camera pose | Detect avg (worst) | PhotonVision CPU | GPU | Margins |
+|---|---|---|---|---|
+| No tag | 1.85 ms | 1.42 cores | 36.4% | |
+| 1 tag | 2.0 ms (~2.8; one 6.2 spike) | 1.62 | 39% | 26–37 |
+| 2 tags | 2.06 ms (2.5–3.4) | 1.67 | 39.9% | 23–37 |
+
+- **The scene mattered more than the tags.** Facing the ceiling lights, with no tag, cost ~10
+  points of GPU and 0.6 ms more than the earlier desk scene: more candidate blobs.
+- **Tags were cheap.** The first tag (488 decodes a second over 4 cameras) cost +0.2 cores and
+  +0.15 ms; the second +0.05 cores and +0.06 ms. Every camera held 122 fps.
+- **Backlit tags** (held under the lights) decoded at margins 5–9 until they were held still and
+  out of the glare.
+
+#### CUDA wait mode again, and splitting JPEG decode between hardware and CPU
+
+Same scene as the tag tests (cameras facing the ceiling lights, no tag), 4 cameras.
+- **CUDA wait mode** (`/tmp/spectrum-971-cuda-sync`, read when PhotonVision starts). Cycled
+  block, spin, yield twice, one restart each, 2 × 10 s after each start settled:
+
+  | Mode | Detect (round 1 / 2) | Typical worst (1 / 2) | CPU |
+  |---|---|---|---|
+  | `block` (default) | 2.16 / 2.33 ms | 4.35 / 4.54 ms | ~1.65 cores |
+  | `spin` | 2.11 / 2.45 ms | 4.57 / 4.91 ms | ~1.65 |
+  | `yield` | 2.10 / 1.87 ms | 3.94 / 3.71 ms | ~1.6 |
+
+  `yield` was best in both rounds, but by ~0.2 ms, which is as big as the restart-to-restart
+  noise. It needs more alternating rounds before changing the default. `spin` no longer gains
+  anything, now that the cameras don't queue on CUDA's lock.
+- **Hardware and CPU decode split** (`nvjpg:N` in `/tmp/spectrum-jpeg-decoder` or
+  `SPECTRUM_JPEG_DECODER`: the first N cameras, in the order they first decoded, use NVJPG, the
+  rest libjpeg-turbo; live). Alternating, 12 s each:
+
+  | | Frame age at result | Detect | Decode NVJPG / turbo | CPU |
+  |---|---|---|---|---|
+  | **All 4 NVJPG** | **13.5 ms** | **2.2 ms** | 3.0 / – ms | **1.6 cores** |
+  | `nvjpg:3` | 14.2 ms | 2.9 ms | 2.9 / 3.1 ms | 1.9 |
+  | `nvjpg:2` | 15.0 ms | 3.3 ms | 2.9 / 3.2 ms | 2.25 |
+
+  **Worse, keep all 4 on the hardware.** In this bright scene libjpeg-turbo took 3.1–3.2 ms (2.4 ms
+  on the earlier plain scene), and freeing NVJPG gained only 0.1 ms. The CPU-decoded cameras also
+  lose GPU input (an upload again), and the decode threads compete with the detection threads
+  (cross-core wakeups 12k → 24k a second), so detection got 0.7–1.1 ms slower.
+- **New: `frame age at result`** in each `971 stats` line: capture (the first USB packet) to the
+  end of detection, per camera. 13.5 ms here ≈ 8.1 (the camera sending the frame) + 3.0 (decode) +
+  2.2 (detection); add half the exposure for mid-exposure to result.
+
+#### Detection masks drawn on the stream (`photonvision-40`, `bos-07`)
+
+- **Why:** facing the shop's ceiling lights cost ~10 points of GPU and 0.6 ms before any tag was in
+  view (above). On a field, the upper part of some cameras' views is arena lighting and truss.
+- **UI:** a **Mask** tab (AprilCudaTag and Object Detection pipelines) sets the mode (Off /
+  Ignore inside the boxes / Search only inside the boxes). Its "Draw on the stream" switch lets you
+  draw on either dashboard stream: drag on empty space to draw a box, drag a box to move it, drag
+  any of its 4 corners to resize (the opposite corner stays put), and press Delete to remove the
+  selected box. The table lists the boxes, each with a delete button. The mask is shown faintly on
+  both streams whenever it's on.
+- **Reusable:** `pv-mask-overlay.vue` (components/common) wraps any stream or image with an SVG in
+  image fractions and edits a `DetectionMask` ({mode, boxes: [{x, y, w, h}]}, 0–1, on the image as
+  displayed, i.e. after rotation). The setting lives on `AdvancedPipelineSettings`, so any advanced
+  pipeline can use it; `VisionModuleChangeSubscriber.setProperty` converts it with Jackson.
+- **AprilCudaTag (GPU, `bos-07`):** `GpuDetectorJNI.setMask(handle, mode, boxes[])` (called by
+  `AprilTagDetectionCudaPipe.setMask` from the pipeline's parameters, only when the mask changed).
+  The library turns it into a keep/ignore image at the detector's half size. `ApplyMask` turns
+  ignored pixels into "no contrast" (127) right after thresholding, so no blob, edge or tag is found
+  there. It's part of the first-stage graph; switching the mask on or off records the graph again
+  (at most once a second per detector; meanwhile the steps run one by one). Moving or resizing boxes
+  only copies new bytes into the same GPU buffer. An "only inside" mask with no boxes does nothing.
+  Log: `971 detector hN: mask ignoring N box(es)`.
+- **Object detection:** detections whose centre is ignored are dropped before PhotonVision's own
+  filters.
+- **Checked** (`fieldcal_detect --mask`, synthetic TopLeft, 814 tags): ignoring the left half
+  removed all 349 tags fully on the left and kept all 433 on the right with **byte-identical
+  corners**. The 32 tags crossing the middle were dropped, as expected. "Search only the right half"
+  gave the same result. In the UI: drawing, moving, 4-corner resize and Delete all reached the
+  detector live, and changes are saved 1 s later (ConfigManager).
+- **Two dashboards editing the same mask overwrote each other** while testing: one tab's stale
+  boxes replaced the other's. The cause was a general bug, fixed in `photonvision-41` (below).
+
+#### Other dashboards never saw setting changes (`photonvision-41`)
+
+`VisionModule.saveAndBroadcastSelective` sends each pipeline-setting change to the other open
+dashboards as `{mutatePipelineSettings}`. But `App.vue` applies it only when the message also
+carries `cameraUniqueName`, which it never did. So a second dashboard showed stale values for
+every setting (sliders, exposure, masks) until reloaded, and could send them back. Now the message
+carries the camera's name. Checked: a change in one tab showed up in a second tab within 2 s, and
+a mask box added from one browser appeared live on another.
+
+#### Unplugging a camera, and cold boots, with 4 cameras (2026-09-29)
+
+All on the finished build (patches up to `photonvision-44`, `bos-07`). Logs recorded with
+`journalctl -f` and the kernel log.
+- **TopRight pulled for ~10 s, then plugged back into the same port:**
+  - Frames stopped at the kernel's "USB disconnect". cscore retried opening it every 0.3 s.
+  - Plugged back in, the kernel enumerated it in 0.2 s (and the payload cap re-applied).
+  - cscore reconnected, restored 1280x800 at 120 fps and its settings, and it was detecting 1.3 s
+    after going back in, at the full 122 fps by 2.2 s.
+  - The other 3 cameras: minimum 121.0 fps, average 122.0.
+- **TopLeft yanked and pushed straight back (out 1.0 s):**
+  - The kernel re-enumerated it 0.23 s after it went back in.
+  - cscore reconnected 1.35 s after the frames stopped. Its first open raced the kernel finishing
+    setup and failed a dequeue, and the second succeeded 0.4 s later.
+  - One partial second of detections was lost (37 fps), then 122.
+  - The other 3: minimum 119.7 fps.
+  - The watchdog never had to act: cscore's own reconnect handles a camera that leaves USB.
+- **Two cold power cycles** (power cut ~5 s):
+
+  | | Linux ready | All 4 detecting |
+  |---|---|---|
+  | Boot 1 | 16.7 s | 21.8 s |
+  | Boot 2 | 16.1 s | 21.1 s |
+
+  Both times all 4 cameras came up at 1280x800 and 122 fps, with GPU input 100%, 4 first-stage
+  graphs recorded, and no capture errors, detector failures, hardware decoder off, S_FMT EBUSY,
+  or `ConcurrentModificationException`. `health-check.sh` said READY. That's the same ~20 s to
+  detecting as with 2 cameras, so tonight's startup work (the capture lock, graph recording)
+  costs no measurable boot time.
+
+#### Five Thriftiest Cams (2026-09-29)
+
+The 5th camera ("5th Cam") on a USB 3 hub in the Jetson's USB-C port (USB 2.0 side `1-1.1`),
+so SSH went over Wi-Fi. `payload_cap` had a leftover `1-1.1:256` port entry, which beats the
+model's 1280. It was raised to 1280 at runtime only (`/etc/modprobe.d/90-spectrum-uvcvideo.conf`
+unchanged), so after a reboot that port is 256 again unless it's set on the USB bandwidth card.
+- **USB budget:** 6,400 of ~6,720 bytes per 125 µs allocated (320 free), 39.6 of 53.8 MB/s used.
+  All five held 121–122 fps. The largest frames were 52–76 KB. BottomLeft's 75.5 KB used 88% of its
+  allocation ("fits 1.1x"), and three cameras were at 80–88%. At 90% or more a camera compresses
+  harder instead of dropping frames. A 6th camera doesn't fit at this cap.
+- **Load** (cameras facing the ceiling lights, no tag, 3 × 10 s), against 4 cameras in the same
+  scene. The first 5-camera run still had 2 streams "open": dead connections from the laptop's
+  unplugged USB-C link (below). The clean run was after a PhotonVision restart, with none:
+
+  | | 4 cameras | 5 cameras, 2 dead streams | **5 cameras, clean** |
+  |---|---|---|---|
+  | Frames/s | 488 | 610 | 610 |
+  | Detect avg (worst) | 1.85 ms | 2.4 ms (3.7–5.9) | **2.1 ms** |
+  | GPU | 36.4% | 45.5% | **44.4%** |
+  | PhotonVision CPU | 1.42 cores | 1.9 cores | **1.87 cores** |
+  | Frame age at result | 13.5 ms | 14.0 ms | **13.3 ms** |
+  | NVJPG decode | ~3.0 ms | 3.3 ms | **2.8 ms** |
+  | Board power, tj | ~10.6 W | 11.2 W, 56.8 °C | **11.1 W, 56.5 °C** |
+
+- **Scaling is linear now:** GPU +25% for +25% frames. The next limits are USB (full) and the two
+  NVJPG engines (queueing more), not the GPU or CPU.
+- **The hub** (with a built-in ASIX AX88179 gigabit Ethernet) logged register errors (`Failed to
+  write reg ... -32`) the whole time. That's harmless for the cameras, but it floods the kernel
+  log; use a plain USB 2.0 hub on the robot.
+- **Fanless:** 11.1 W is close to the 12 W fanless test (~73 °C with the plate), so test fanless
+  with 5 cameras before relying on it.
+- **Dead viewers kept their streams for ~15 minutes.** The laptop's USB-C link was unplugged with
+  a dashboard open, and its two stream connections stayed "established" with ~78 KB queued each.
+  cscore still counted them as viewers, so PhotonVision kept resizing and encoding those frames
+  for nobody. Linux gives up on an unanswering peer only after `tcp_retries2` retransmissions
+  (default 15, ~15 min with data queued). `ss -K` can't close them on this kernel. That happens
+  whenever a laptop leaves without closing the dashboard: lid shut, cable pulled, Wi-Fi gone,
+  driver station swapped.
+- **Fix: `09-robot-tuning.sh` step 11**, `net.ipv4.tcp_retries2 = 5` in
+  `/etc/sysctl.d/90-spectrum-tcp.conf` (gives up after 0.2 s × (2⁶ − 1) ≈ 12.6 s; `--undo` restores
+  15). It applies to every connection: NT reconnects by itself, and an SSH session dies if the
+  network is out for over ~13 s with data waiting. **Tested:** a dashboard open over Wi-Fi, then
+  the laptop's Wi-Fi switched off. The Jetson dropped its two stream connections 11.4 s and 12.9 s
+  later (clocks lined up from NetworkManager's log and `date` on both). The Wi-Fi came back after
+  9 s, but the drops came 2–4 s after the radio did, before the laptop could have rejoined.
+
+#### Upstream fixes and a real reconnect for stuck cameras (`photonvision-42` to `-44`)
+
+From the upstream review (`docs/UPSTREAM-PORT.md`, 2026-09-29):
+- **`photonvision-42` (upstream #2617):** `currentVideoFormat` is `VideoFormat | undefined`, and its
+  callers allow for it, as do the stream's aspect ratio and the 3D view (they indexed
+  `validVideoFormats` directly). Before, dashboard tabs could vanish while a camera was activating.
+- **`photonvision-43`: the stuck-camera "reconnect" now reopens the camera.** `photonvision-29`'s
+  first step set `kForceClose` and then `kAutoManage`, which in cscore's Linux camera only stops and
+  restarts streaming (see `photonvision-37`). So in its bench test the camera came back only at the
+  USB-reset step. `reconnectCamera` now switches through another video mode and back: cscore then
+  closes the device, opens it, sets the format and streams again, twice. The video-mode fix
+  (`-37`) and the bandwidth retry share it. Tested with the stuck-camera hook on BottomLeft:
+  "reopening it (switching through 640x360)" at +3.0 s, cscore `set format 640x360` then
+  `1280x800`, hook lifted at +4.5 s, and "delivering frames again, after a reconnect" with no USB
+  reset. All 4 cameras at 122 fps afterwards.
+- **`photonvision-44` (upstream #2352):**
+  - `reactivateDisabledCameraConfig` logged "already in use by active VisionModule! Cannot
+    reactivate", then reactivated anyway, binding two modules to one device. Now it puts the config
+    back and returns false, as the "add camera" branch next to it already did.
+  - Camera Matching cards are titled by nickname, with the device model underneath; identical
+    cameras were all "Thrifty:".
+  - The delete dialog names the camera being deleted, not the one selected on the dashboard.
+  - Not tested live: there were no disabled configs left to try it with.
+
+#### Start from, Create on every camera, Switch all (`photonvision-46`)
+
+- **`POST /api/settings/createPipeline`** `{name, type | fromCamera + fromPipeline, cameras, switchCamera}`
+  answers `{created: [{camera, index}], skipped: [{camera, reason}]}`. The new-pipeline dialog uses
+  it for every create, blank or not. `VisionModule.createPipeline` does the work:
+  - adds a pipeline of the source's type (or `type`) through `PipelineManager.addPipeline`, so it
+    starts from this camera's defaults;
+  - copies every public field from a deep copy of the source (JSON round trip: `clone()` is
+    shallow and would share the mask, HSV ranges and offset points), except the index and name;
+  - from another camera, also skips `inputImageRotationMode`, the exposure limits and
+    `detectionMask`, and `cameraVideoModeIndex` unless the video mode lists are equal (the same
+    rule as Copy settings, `-25`);
+  - skips a camera that already has a pipeline by that name. Only `switchCamera` switches to it.
+- **Switch all** is client-only: `changeCurrentPipelineIndex(N, true, camera)` for each camera with a
+  pipeline N that isn't in driver mode (-1), calibrating (-2) or focusing (-3). The snackbar names
+  the cameras skipped and any whose pipeline N has a different name.
+- **`uiState`** now also has `pipelines`: every pipeline's saved settings (unwrapped from Jackson's
+  `["type", {...}]`), so tests can check pipelines that aren't running. A pipeline deleted during
+  the read ends the list rather than throwing (the first version threw a NullPointerException).
+- **Tests** (`tests/ui/specs/pipelines.spec.ts`):
+  - A same-camera copy has every saved setting equal to the source.
+  - Create on every camera from TopLeft's `zz-uitest` (Decision Margin 23, 90° orientation) gave
+    "Created 'zz-uitest-all' as pipeline 2 on TopRight, TopLeft; as pipeline 1 on 5th Cam,
+    BottomRight, BottomLeft". Every copy has 23; only TopLeft's has 90°; the others stayed on their
+    pipelines.
+  - Switch all from pipeline 2: "switched TopRight. Not switched: 5th Cam (no pipeline 2),
+    BottomRight (no pipeline 2), BottomLeft (no pipeline 2)".
+  - The test then deletes the copies everywhere and puts every camera back on its pipeline.
+  - A test guard: an entry must carry the pipeline's name. Before the unwrap fix, two error
+    entries compared equal and the exact-copy test passed without checking anything.
+  - A slider sends 20 ms after the last change, so the test waits for the backend before switching
+    tabs. A tab closed within those 20 ms drops the change; a person can't switch that fast.
+
+#### Pipeline numbers shown (`photonvision-47`)
+
+The dashboard's Pipeline dropdown and the Camera Matching page's pipeline lists show "N: name"
+(Copy settings and Start from already did). Profiles and Switch all go by number, and names alone
+hid mismatches such as TopRight's pipeline 1 being "Fuel Test". Test: the dropdown's options equal
+`uiState`'s `pipelineNicknames` numbered from 0. The test helpers read and pick pipelines by name
+inside "N: name". Suite: 5 tests, 1.5 min, all passing.
+
+#### Frame timestamps from the camera clock (`uvcvideo hwtimestamps=1`, 2026-09-30)
+
+- **Before:** uvcvideo stamps a frame when its first USB packet is processed. It processes packets
+  in URBs of 32 microframes (4 ms), so stamps land on 4 ms steps: intervals of 8 or 12 ms instead
+  of 8.245, jitter 0.95 ms, identical on every camera. (The camera does mark each frame's end,
+  "Frame complete (EOF found)" in the driver trace, so there's no wait for the next frame.)
+- **After:** `hwtimestamps=1` makes uvcvideo convert the camera's own PTS (in its clock, through
+  the SCR it sends) to the host clock. The Thriftiest Cam sends both. On the stamp's meaning: it's
+  0.74 ms before the first-packet stamp on average, so it marks roughly when the camera starts
+  sending, not the start of exposure. `photonvision-13`'s half-exposure correction is unchanged,
+  and the camera's delay from the end of exposure to sending is still unmeasured
+  (`SPECTRUM_CAMERA_DELAY_US`, the robot spin test).
+- **Measured** (`tests/uvc-timestamps/run.sh`: v4l2-ctl, PhotonVision stopped, one or all
+  cameras):
+
+  | 600 frames per camera, all 5 at once | Jitter | Intervals |
+  |---|---|---|
+  | first USB packet | 0.95 ms | 7.97-12.00 ms |
+  | camera clock | 0.004-0.007 ms | 8.22-8.27 ms |
+
+  **As the robot sees it** (`tests/fake-robot/timestamps.sh`: a fake robot, enabled, subscribed to
+  every camera's results; the capture timestamp in each result's metadata; 30 s, 3,640 results a
+  camera): jitter **0.955 -> 0.008-0.011 ms** (BottomLeft 0.036, range 7.60-8.89 ms, from the
+  occasional clock-recovery correction). 1 ms of timestamp error is 0.36 deg at 360 deg/s.
+- **Where:** `/etc/modprobe.d/91-spectrum-uvcvideo-timestamps.conf`, written by
+  `11-uvcvideo-payload-cap.sh --install` (its own file, so the Camera Matching page's
+  `payload_cap` rewrites never touch it). The parameter is also writable at run time; streams
+  opened after the change use it (restart PhotonVision). `health-check.sh` checks it. Frame age
+  in the `971 stats` lines reads 0.5-1 ms higher, as the stamps are earlier and truer.
+- The fake robot result reader needed PhotonVision's own type string (`photonstruct:...`) to
+  subscribe, and a topics-only subscription for the topics to be announced to it at all.
+
+#### Smaller USB batches: 16 packets per URB (`kernel/uvcvideo-urb-packets.patch`)
+
+uvcvideo queues 5 isochronous URBs of `UVC_MAX_PACKETS` (32) packets, 4 ms each at one packet per
+125 us microframe, and sees a URB's packets only when the whole URB completes. So a frame's last
+packet (the camera marks the end with EOF) can wait up to 4 ms, 2 ms on average, before the frame
+is handed over. The patch adds `urb_packets` (0 = stock); like `payload_cap` it's writable at run
+time and applies when a stream next starts. `tests/`: `urbtest.sh`-style runs, 40 s warm-up then
+60 s per value, 5 cameras, camera-clock timestamps:
+
+| `urb_packets` | Frame age at decode | At result | Whole-system CPU | Interrupts/s |
+|---|---|---|---|---|
+| 32 (stock), 3 runs | 9.33 ms | 12.98 ms | 1.09 cores (0.98-1.26) | 15,500 |
+| **16**, 3 runs | 8.25 ms | **11.76 ms** | 1.18 cores (1.16-1.20) | 17,900 |
+| 8, 2 runs | 7.94 ms | 11.61 ms | 1.30 cores (1.19-1.40) | 20,000 |
+
+- **16 kept:** 1.2 ms lower latency at the result, every run, worst frame age 17 ms instead of
+  18-21 ms, 122.2 fps, no USB errors, about 0.1 core more (within the stock runs' spread).
+  PhotonVision's own CPU is unchanged; the extra is kernel time.
+- 8 gains only 0.15 ms more for more CPU and interrupts: the host controller doesn't interrupt
+  much more often than every millisecond.
+- The remaining ~8 ms from first packet to decode is the camera: it paces a 24 KB frame out over
+  about one frame period while its sensor reads out (the frame takes ~2.4 ms at our 1280-byte cap
+  if sent at once).
+- **Live vs saved:** `health-check.sh` now compares each driver setting's live value with
+  `/etc/modprobe.d` and warns when a reboot would change it. Reinstalling the driver showed why:
+  the 5th camera's 1280-byte cap (port 1-1.1) had only been set live, so the saved file still had
+  256, and the Camera Matching card showed 1280 with nothing to save. Saved on 2026-09-30.
+- Saved in `/etc/modprobe.d/92-spectrum-uvcvideo-urb-packets.conf` by
+  `11-uvcvideo-payload-cap.sh --install` (`URB_PACKETS` overrides); `--undo` removes it with the
+  patched driver. `health-check.sh` checks it.
+
+#### Garbage collection and the worst-case detects (2026-09-30)
+
+The 4-7 ms worst-case detects seen earlier came with dashboards streaming or tests running; a clean
+2-minute run had none over 1.8 ms. Garbage collection does cause the remaining ones: with the
+default setting (G1, `-Xmx512m`), 3 of the 4 seconds with a detect over 3 ms contained a young
+collection, against 12% of seconds overall. `tests/jvm-gc/probe.sh` switches the GC log on live
+(`jcmd VM.log`, no restart) next to the per-second worst detects; `compare.sh` restarts with other
+flags. 5 cameras, ceiling scene:
+
+| JVM | Collections | Pause | Seconds with a detect over 3 ms | Worst | CPU | RSS |
+|---|---|---|---|---|---|---|
+| **G1 `-Xmx512m` (kept)** | every ~8 s | 6-10 ms | 4 in 2 min | 4.9 ms | 0.98 | 2.29 GB |
+| G1 `-Xms1g -Xmx1g -Xmn512m` | every ~3 min | **274-278 ms** | 3 in 8 min | 30.6 ms | 0.97 | 2.96 GB |
+| same + `-XX:+AlwaysPreTouch` | every ~3 min | **276-287 ms** | 7 in 6 min | 7.8 ms | 0.95 | 3.33 GB |
+| ZGC `-Xmx1g` | concurrent | < 0.2 ms | 21 in 6 min | 22.5 ms | 1.07 | 2.74 GB |
+
+- **Kept the default.** A 512 MB young generation turns the 7 ms pauses every 8 s into a
+  quarter-second freeze of every camera every 3 minutes. The first 2-minute test of it ended before
+  its young generation filled and looked perfect; the longer run showed the pause. Pre-touching the
+  heap didn't change it, so it isn't page faults: G1 copies more survivors from a young generation
+  that lives 3 minutes instead of 8 seconds. ZGC's pauses are tiny, but its concurrent work and
+  barriers gave more slow seconds and 0.1 core more.
+- **Averages don't move.** A collection delays about one frame per camera in ~976, by up to ~7 ms:
+  about 0.007 ms on the average latency. Frame rates stay at 122. Results keep their capture
+  timestamps, so the pose estimator places a late one correctly; only its arrival is late.
+- The GC on disable (`photonvision-49`, 27 ms while disabled) stays.
+- PhotonVision allocates about 2.6 MB/s (young 37 MB -> 19 MB every ~7 s).
+
+#### Far-tag search (`detector/far_search.cc`, `photonvision-55`)
+
+bos hard-codes `quad_decimate` 2 (quads found on a 640x400 image; refinement and decoding still use
+the full image). Measured 2026-09-24: ~20 px is the smallest tag found reliably, against ~12 px on
+the full-size image, which costs ~2.75x the GPU every frame. This searches the full-size image only
+when the robot is short of a good pose:
+
+- **Policy** (all cameras share it: they're one process). A camera has a *good view* with at least
+  2 tags of 40 px or more and decision margin 30 or more (`GoodView`; near tags, a solid multi-tag
+  pose; judged from the detections, not PhotonVision's multi-tag, which needs a calibration three
+  cameras don't have yet). No good view on any camera for 250 ms = *starved*: then one camera at a
+  time (round robin: the active camera whose last full-size search is oldest), at most
+  `farSweepsPerSecond` (30) across all, runs a **full-size search**: its frame upscaled 2x
+  (nearest neighbour, plain C++), through one shared 2560x1600 971 detector, so the half-size
+  search sees every pixel. Tags it finds that the normal search didn't are **tracked** with
+  160x160 crops upscaled to 320x320 (a detector per camera), one crop per camera frame, until
+  they're 24 px or more in the normal search's results or unseen for 300 ms. The moment any
+  camera has a good view, no searches or crops, and the tracks are dropped.
+- **Guards:** after a full-size search taking T, the next waits at least 5 T (at most ~20% of the
+  time, however slow the scene makes them). The shared detector is built on the first frame
+  (~200 ms), not on the first search. Far-search detectors have their own tag family: adding a
+  family to a detector stores that detector's decode table in it, so sharing the camera's would
+  overwrite and on destroy free the camera detector's table. The detection mask is applied to
+  far tags by their centre. No OpenCV functions (PhotonVision's JVM has its own OpenCV; a second
+  one's symbols could clash): the upscale and crop are plain loops.
+- **Coordinates:** X = U/2 in the upscaled image. The AprilTag library's decimation convention
+  suggested X = U/2 + 0.25; `far_search_test` measured the full-size corners +0.24 px off with that
+  (the 971 detector puts pixel edges at whole numbers), and -0.01 / -0.02 px (worst 0.125) with 0.
+  The homography is scaled with it (H' = T H) and the crops' camera matrix follows each crop.
+- **Bench test** (`tests/far-search/run.sh`, `detector/far_search_test.cc`, on the Jetson; real
+  tag36h11 tags from `apriltag_to_image`, 7 deg, blurred, camera-like noise):
+
+  | | Result |
+  |---|---|
+  | Smallest tag found 4 of 4 times | normal 18 px, far search **10 px (1.8x)** |
+  | Corners, full-size against normal | -0.010 / -0.017 px mean, 0.125 px worst |
+  | 2 near 70 px tags + a far 14 px one, 1 s | 0 full-size searches, 0 extra tags |
+  | Near tags hidden | starved after 246 ms; far tag found then, and on 92 of 92 frames after as it moved 1.5 px a frame (the normal search alone: 92 of 122) |
+  | Near tags back | 0 extra tags at once |
+  | Budget | 21 full-size searches in the 0.75 s starved (30 a second) |
+  | Off | nothing extra |
+
+  The first version of the test used raw per-pixel noise: through the upscale every speck was a
+  candidate quad and a search took 94 ms. Camera-like noise (smoothed, as JPEG does) takes 4-6 ms,
+  as the real recordings measured before.
+- **Live** (5 cameras, bench, no tags in view, so searching the whole time; 60 s each):
+
+  | | Off | On |
+  |---|---|---|
+  | fps | 122 all | 122 all |
+  | GPU | 16.5% | 19.4% |
+  | Board | 9.7 W | 10.1 W |
+  | Frame age at result | 12.08 ms | 12.29 ms |
+  | Worst detect per second | ~1.0 ms | ~2.0 ms (sharing the GPU with a search) |
+
+  27 full-size searches a second, 2.7 ms each; `971 far search 10 s:` lines in the log. While any
+  camera has a good view it's off, so this is the most it costs.
+- **Settings:** `farSearch` (default on) and `farSweepsPerSecond` in `spectrum-robot-state.json`,
+  Settings > Robot state; `GpuDetectorJNI.setFarSearch` / `farSearchStatus` (retried at most every
+  5 s until the library is loaded). `/api/robotState` has the counters; `health-check.sh` reports
+  it. Browser test `far-search.spec.ts`: the status, and no searches while off.
+- **`bos-08`, found by replaying recordings:** one frame of session 0008 (TopRight 174, a busy
+  bench scene) made a full-size search run for minutes (still going at 80 s; `fieldcal_detect
+  --upscale 2`, which doesn't use the far search, hung on it too). In `RefineEdges`,
+  `nsamples = max(16, edge length / 8)` is unbounded: a candidate quad with a corner far outside
+  the image gave hundreds of millions of samples, each searched over 25 steps. The half-size
+  search never makes such quads (they stay inside its 640x400 image), so it never showed before.
+  The patch skips quads with a corner that isn't finite or is more than an image's size outside
+  it, and caps `nsamples` at (width + height) / 8 (260 for 1280x800; only edges over 2,000 px
+  reach it). Frame 174 at full size now takes a few ms; normal-size results are unchanged (0007:
+  305 sightings before and after; bench test passes). Live, one such frame would have frozen a
+  camera's thread: the time guard spaces searches out but can't stop one that has started.
+- **Replay: `far_replay`** (`detector/far_replay.cc`, `tests/far-search/replay.sh`). A whole Rewind
+  session, every camera merged in recording-time order, through per-camera detectors with
+  PhotonVision's settings and the far search deciding on each frame on the recording's clock (its
+  policy spans cameras, so they replay together). `--off` for a baseline, `--calib CAMERA=...`,
+  `--budget`, `--every`, `--trace` (each frame's far-search time as it goes, to find a stall),
+  `--out` (every detection with its source, normal or far). It reports tag sightings with and
+  without the far search, tags only the far search found and their smallest size, time starved,
+  searches and crops, and the slowest frames. The recording reader and JPEG decoder moved to
+  `detector/rewind_reader.h`, shared with `fieldcal_detect`.
+  - **Known-answer check** (`replay.sh`): `far_search_test --write-session` writes a synthetic
+    session (CamA: near tags for the first and last second, a moving 14 px tag all along; CamB:
+    none; JPEG quality 85). `far_replay` finds the far tag on 14 frames the normal search missed,
+    all inside the no-good-view window (1.25-2.0 s), and nothing extra with `--off`.
+  - **The five bench recordings** (2026-09-24, no far tags in them): all replay in 1-8 s; full-size
+    searches 4.5-10 ms each (the replay shares the GPU with the live cameras); the only slow frame
+    in each is the first (the detector build, ~130 ms).
+  - **Deadlines:** `replay.sh` gives each session 60 s + 1 s per 100 frames and reports TIMEOUT as
+    a failure. The first run used a flat 15 min per session, which hid the stalled frame for 6 min.
+- **Not tested yet:** real far tags (on a field, or a long hallway). The library before the far
+  search is at `/usr/lib/lib971apriltag.so.before-far-search` on the Jetson.
+
+#### Tag contrast and the Gain slider (`photonvision-54`)
+
+- **`TagContrast`:** for each detection the GPU AprilTag pipeline keeps (after the decision margin
+  and hamming filters) that's at least 24 px a side, a homography from the unit square to its
+  corners places 64 samples half a cell inside the edge (the black border; 36h11 is 8 cells across
+  it) and 64 half a cell outside (the 1-cell white margin), along the middle 70% of each side.
+  Medians of white and black, and the share of white samples at 250 or more. At most every 200 ms
+  per pipeline; the measurement rides on `CVPipelineResult`, and `VisionModule` records it per
+  camera. `GET /api/tagContrast` gives each camera's medians over the last 2 s and a verdict:
+  whites clipping (over 10% at 250+), low contrast (under 50), blacks lifted (over 80), good, or no
+  tags (none measured in 3 s). Thresholds are first guesses to check against a tuner run.
+- **Shown:** the Input tab (above Auto Exposure, polled every 1 s), Match Ready's tiles, and
+  `health-check.sh` (PASS or WARN, only for cameras with a tag in view).
+- **Unit tests** (`TagContrastTest`, photon-core, on the laptop): a flat-on tag of 30 on a 200
+  margin reads white 200 / black 30 / 0% clipped; a tilted one on a 255 margin reads 100% clipped;
+  a 20 px tag and a measurement 0 s after the last return nothing; the verdicts and advice. 4 of 4.
+- **Gain:** `QuirkyCamera` lists the Thrifty OV9281 (1bcf:28c5) with `Gain` (upstream #2478), but
+  ours has no gain control (`v4l2-ctl -l`: brightness -64..64 at 64, contrast, gamma 176 against a
+  default of 150, sharpness, backlight compensation, exposure; no gain). `hasGainControl()` now also
+  asks the camera (`VisionSourceSettables.hasControl`, true until it's connected so a camera with
+  real gain keeps its value while unplugged), so `cameraGain` is -1 and the slider hides, and the
+  Field Calibration tuner no longer steps gain. Browser test: `camera-controls.spec.ts`.
+- **Not measured yet:** brightness at +64 (the maximum, chosen in the tuning guide to make up for no
+  gain) adds an offset that lifts the tag's blacks too; gamma 176 isn't the default. The Field
+  Calibration tuner with a tag in view settles both; the tag contrast readout will say why.
+
+#### Settings snapshots (`photonvision-53`)
+
+- `SettingsSnapshots` keeps `/opt/photonvision/snapshots/ID/` (ID = `yyyyMMdd-HHmmss`):
+  `photon.sqlite` copied with SQLite's `VACUUM INTO` after `saveToDisk()` (consistent even if a save
+  is running), the config folder's `spectrum/` (excluded tags), `extra/` (Robot state, Rewind
+  settings) and `meta.json` (name, reason, time, version, each camera's pipeline names). 2.0 MB.
+  The whole config folder is 76 MB, but 31 MB is logs and 35 MB calibration images.
+- **Restore** takes a "Before restoring 'NAME'" snapshot, stops the write task and the flush on
+  exit, replaces `photon.sqlite` (and removes any `-journal`/`-wal`/`-shm`), `spectrum/` and the
+  extra files, then restarts PhotonVision. Unlike the stock settings import it doesn't delete the
+  config folder, so logs and calibration images stay.
+- **Automatic:** "before restore", and "Field connected DATE" the first time the FMS attaches
+  each day (off the NetworkTables thread). The newest 20 automatic ones are kept; named ones stay
+  until deleted.
+- `GET/POST /api/snapshots`, `POST /api/snapshots/restore {id}`, `POST /api/snapshots/delete {id}`,
+  `GET /api/snapshots/download?id=` (a zip). The card reloads its list when the page reconnects
+  after a restore (the first version showed the old list until reopened).
+- Test (`tests/ui/specs/snapshots.spec.ts`): save "zz-uitest snapshot" in the card, add pipeline
+  `zz-uitest-snap` on TopLeft, restore through the card's confirm dialog. PhotonVision restarted
+  and came back in ~10 s with every camera's pipelines and running pipeline as before and no
+  `zz-uitest-snap`; the "Before restoring" snapshot lists it. Both are deleted afterwards. The
+  Event test deletes the "field connected" snapshot its fake field causes, and the run fails if a
+  `zz-uitest` snapshot is left.
+- A manual copy of the settings from before the first restore test is at
+  `~/photon.sqlite.before-snapshots-20260930-080654` on the Jetson.
+
+#### Match Ready page (`photonvision-52`)
+
+- `GET /api/healthCheck` runs `health-check.sh` (through `/opt/photonvision/health-check.sh`, a
+  link to the repo's copy made by `06-install-fork-jar.sh`; `SPECTRUM_HEALTH_CHECK` overrides)
+  under `timeout 60`, one run at a time, reusing a run less than 3 s old. It parses the script's
+  own output (`== Section`, `PASS/WARN/FAIL text`, other lines as info, the final `READY` /
+  `NOT READY` line), so the page and SSH always agree. 3.7 s as root. `health-check.sh` finds
+  `usb-bandwidth.py` through `readlink -f`, so it works through the link.
+- The page (`/#/ready`, "Match Ready" in the sidebar): the verdict, the WARN and FAIL lines first,
+  a tile per camera from the results the dashboard already receives (pipeline "N: name" and type,
+  fps against the mode's rate, latency, targets, calibrated at the current resolution for AprilTag
+  and ArUco pipelines; low fps isn't flagged while idling), the robot line from `/api/robotState`,
+  and every section folded. Re-runs every 30 s while open.
+- Test (`tests/ui/specs/ready.spec.ts`): the verdict matches the endpoint's, the sections include
+  PhotonVision / Cameras / Robot connection / System, each camera's tile shows its pipeline and a
+  non-zero fps, and Check again brings a newer run. Suite: 9 tests, 2.3 min.
+
+#### Event pipeline when the field connects (`photonvision-51`)
+
+- Settings `eventProfileOnFms` (default off) and `eventPipeline` join idle mode's in
+  `spectrum-robot-state.json`. On the control word's FMS-attached bit going false to true (this
+  includes connecting to a robot that's already on the field), `IdleMode.switchAllTo` sets every
+  camera that has that number to it, skipping driver mode (-1), calibration (-2) and focus (-3).
+  Only on that edge, so later switches (dashboard, robot code, the setting turned off) stick.
+- The summary, kept as `lastEventSwitch` and logged, names cameras whose pipeline at that number
+  isn't the one most cameras have there: "the field (FMS) connected, pipeline 1: switched TopRight
+  (its 1 is 'Fuel Test'), 5th Cam, BottomRight, TopLeft, BottomLeft".
+- `POST /api/robotState {switchNow: true}` runs it by hand (Settings' Switch now).
+- `health-check.sh`: PASS with each camera's pipeline at that number, WARN if one lacks it or
+  has a different name there.
+- Test (`tests/ui/specs/event.spec.ts`, 37 s): `zz-uitest-all` on every camera (pipeline 1 on
+  four, 2 on TopRight), turned on and chosen in the Settings card. The fake robot runs disabled 4 s,
+  then FMS-attached. Every camera switched to 1, and the summary named TopRight's Fuel Test. The
+  test then switched TopLeft back on the dashboard, and 5 s later (FMS still attached) it hadn't
+  moved. Switch now moved it again. Afterwards the settings are restored, the pipelines deleted,
+  and every camera put back. Suite: 8 tests, 2.0 min.
+
+#### Idle mode switch and Robot state card (`photonvision-50`)
+
+- `IdleMode` settings `{idleWhileDisabled, idleFps}` live in
+  `/opt/photonvision/spectrum-robot-state.json` (`SPECTRUM_IDLE_FPS` is only the default).
+  `GET/POST /api/robotState` returns them with `robotConnected`, `enabled`, `autonomous`,
+  `fmsAttached` and `idleNow`. The GC-on-disable listener is registered even with idle off.
+- Settings > **Robot state**: what PhotonVision sees of the robot, the switch, and the idle rate
+  (5-60 fps). Dashboard: while idling, "Robot disabled: cameras idle at 30 fps, full speed on
+  enable" under the FPS, with a **Full speed** button. Both poll `/api/robotState` (1 s / 2 s).
+- `health-check.sh`: PASS "idle while disabled: 30 fps per camera", or WARN while it's off.
+- Test (`tests/ui/specs/idle.spec.ts`): starts `tests/fake-robot` over SSH (50 s disabled, ended
+  early with `/tmp/fake-robot-stop` so later tests don't see a robot). With the robot disabled, the
+  notice shows and the FPS reads under 40 (29). Full speed turns idle off and the FPS goes over
+  100. The Settings switch turns it back on. The setting is restored afterwards. 9 s. Suite: 7
+  tests, 1.5 min.
+
+#### Idle while disabled, GC on disable (`photonvision-49`)
+
+- **`IdleMode`:** `active()` is true while NetworkTables is connected and the Driver Station's
+  control word (`/FMSInfo/FMSControlData`, already read by upstream's `NTDriverStation`, which only
+  logged it) says disabled. `VisionRunner` then waits before each grab until 1/`SPECTRUM_IDLE_FPS`
+  (default 30) after the last one, in sleeps of at most 5 ms that end as soon as the robot is
+  enabled. Frames not grabbed are never decoded, so both the NVJPG decode and the detector are
+  saved. `NTDriverStation` now keeps `current()` and calls transition listeners.
+- **GC:** 0.5 s after each enabled-to-disabled transition, `System.gc()` on a daemon thread, logged
+  as "Robot disabled: garbage collected in N ms, heap A -> B MB".
+- **Test** (`tests/fake-robot/run.sh`, on the Jetson): PhotonVision looks for team 8515's robot at
+  10.85.15.2, so the script adds that address to `lo` for the run and `FakeRobot.java` (a
+  NetworkTables server using PhotonVision's own jar) answers there, with no settings change. It
+  publishes the control word through phases and prints each phase's fps per camera and board
+  power. 5 cameras, ceiling scene:
+
+  | Phase (30 s) | fps per camera | Board |
+  |---|---|---|
+  | disabled | 30-31 | 7.8 W |
+  | enabled | 122 | 9.7 W |
+  | disabled | 31 | 7.8 W |
+
+  "Robot disabled: garbage collected in 27 ms, heap 24 -> 11 MB" 0.5 s after the second disable.
+- **Not yet checked on 2027 robot code:** that 2027 WPILib still publishes `/FMSInfo/FMSControlData`
+  to coprocessors. If it doesn't, idle mode never engages (it fails safe: full rate).
+- **Deadlines:** the script re-runs itself under `timeout` (the phases plus 60 s), so cleanup still
+  runs on a timeout; `FakeRobot` gives up after 30 s without a connection. `tegrastats` is stopped
+  with `tegrastats --stop`: killing its `sudo` left it running and holding the script's output
+  open, which hung the first run.
+
+#### Hidden tabs close their streams (`photonvision-48`)
+
+- `photon-camera-stream` sets its `img` to the empty source while `document.visibilityState` is
+  `hidden`, which closes the MJPEG connection; `photonvision-15` then stops encoding that stream.
+  Shown again, it reconnects.
+- **Upstream bug found on the way:** the stream URL called `inject("backendHostname")` inside a
+  `computed`. `inject` only works during setup, so any recompute (tab shown again, or the backend
+  reconnecting after a PhotonVision restart) built `http://undefined:PORT/stream.mjpg`. Now read
+  once at setup.
+- `uiState` has `streamViewers` per camera (cscore's source enabled = a client is streaming).
+  Test (`tests/ui/specs/streams.spec.ts`): the dashboard's stream reaches the Jetson; hidden (the
+  browser's visibility state and event), the Jetson has no viewer within 10 s; shown, the viewer
+  and a decoded frame are back. Skipped if another dashboard is already watching that camera.
+
+#### Browser tests (`tests/ui`, `photonvision-45`)
+
+Playwright, run from the laptop in its own Chrome against the live Jetson (`tests/ui/run.sh`, which
+opens the SSH tunnel for port 5800 and the stream ports 1181-1200). Written after the gamma slider
+(`-39`) and the second-dashboard bug (`-41`) got through: in both, the camera changed but a page
+didn't show it.
+- **`photonvision-45`:** the shared controls (`pv-slider`, `pv-switch`, `pv-select`,
+  `pv-range-slider`, `pv-number-input`, `pv-radio`, `pv-input`) carry `data-pv-control` and
+  `data-pv-label` (sliders also `data-pv-min/max/step`), so tests find controls by label rather than
+  by Vuetify's generated ids. `GET /api/spectrum/uiState` returns the backend's own copy of each
+  camera's current pipeline settings and extra controls. Read-only.
+- **Nothing is reset.** Each test duplicates the camera's current pipeline, renames the copy
+  `zz-uitest`, works on it, then deletes it and switches back (the fixture in `lib/fixtures.ts`).
+  A killed run's leftover `zz-uitest` is deleted by the next one. Refuses to run while the robot is
+  connected (`/api/rewind`'s `robotConnected`).
+- **`round-trip`:** every visible control on every tab. It changes each one the way a person would
+  (the arrow buttons for sliders, the menu for selects), then checks that the page shows the value,
+  that the backend changed (a diff of `uiState`, which also names the setting each control
+  moves), and that a second browser context shows it. Then it puts the value back and checks all
+  three again. On TopLeft's AprilTagCuda copy: 20 controls in 30 s. The whole suite (4 tests) takes 1.2 min.
+  - Extra controls store -1 for "camera default", so -1 is compared as the default.
+  - "Draw on the stream" is local to one browser and is skipped.
+  - Resolutions are skipped (`PV_UI_TEST_VIDEO_MODES=1` includes them).
+- **`mask`:** draws a box on the stream, resizes it from the bottom-right and top-left corners
+  (the opposite corner stays put), moves it, adds a second box, removes the first with Delete, then
+  Remove all. Each step is checked against the backend's box coordinates (within 2%) and the
+  second dashboard's box table. 10 s.
+- **Proved against the bug:** a jar with `-39` undone (`updateStore` false again) fails exactly
+  Contrast, Gamma and Sharpness with "page didn't show the new value", and Backlight Compensation
+  with "didn't go back". The good jar then passes.
+- **Deadlines:** 10 s for any click or fill (`actionTimeout`; Playwright's default is none, and a
+  stuck locator hung the first run silently), 2 min a test, 8 min a run (`globalTimeout`), and
+  `run.sh` kills anything past 10 min.
+- **Left-behind check:** `global-setup` records every camera's running pipeline; `global-teardown`
+  fails the run if one ends elsewhere or a `zz-uitest` pipeline remains. Added after a crashed
+  cleanup left TopRight on its object-detection pipeline, which later runs then treated as normal.
+
+#### Extra camera control sliders snapped back (`photonvision-39`)
+
+Contrast, gamma, sharpness and backlight compensation (`photonvision-28`) show the store's value
+one-way (`:model-value`, not `v-model`). But `setExtraControl` sent the change with
+`updateStore = false`, so the camera changed (the preview did) while the slider and its number
+went back to the old value. Now it updates the store.
+
+For comparison, one camera alone took 1.45 ms and 7% GPU at the start.
+
+#### First stage as one CUDA graph (`bos-05`)
+
+- **What:** `GpuDetector::RecordFirstStageGraph` records the fixed-size first stage once per
+  detector: the labels memset, threshold and decimate (4 kernels), labeling (5 kernels), the
+  point-count memset, `BlobDiffCompact`, and the count's copy to the host. `Detect()` then launches
+  it as one graph: 13 CUDA calls a frame become 1. `FirstStageGraphWanted` asks for a new
+  recording if the input's GPU buffer or `min_white_black_diff` changes (at most 8 per detector
+  slot, then it runs ungraphed). Used only with the fused `BlobDiff`, a gray image and no event
+  timing; `0` in `/tmp/spectrum-971-graph` goes back to launching the steps one by one.
+- **Recording must happen with no other CUDA work in the process.** The first version recorded
+  inside `Detect()`, on the first frame. When all 4 cameras started at once, that broke CUDA
+  calls on the other threads, which aren't allowed while any stream is capturing:
+  - a scan on CUDA's legacy stream ("operation would make the legacy stream depend on a capturing
+    blocking stream"),
+  - `cudaFree` from a detector rebuild ("operation not permitted when stream is capturing"),
+  - the hardware decoder's `cuGraphicsEGLRegisterImage` (CUresult 900), which switched the
+    hardware JPEG decoder off for the whole run.
+
+  That happened on 4 of 10 starts. The A/B tests had missed it, because they switched the graph on
+  live, after startup. Now `processimage` records it holding `CudaCaptureLock` exclusively.
+  Every CUDA path in `lib971apriltag.so` holds that lock shared: detect, gray and colour decode,
+  create and destroy. So does the TensorRT library, through `spectrum_cuda_lock_shared` /
+  `spectrum_cuda_unlock_shared`, found with `dlopen(RTLD_NOLOAD)`. The lock is a
+  writer-preferring `pthread_rwlock` (`PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP`), since with
+  8 threads taking it shared, glibc's default would let a recording wait indefinitely. Each
+  recording logs `971 detector hN: first-stage graph recorded`. `fieldcal_detect` (one thread)
+  records right before its first `Detect()`.
+- **The line-fit scan's stream (`bos-06`).** `cub::DeviceScan::InclusiveScanByKey` in `Detect()`
+  had no stream argument, so it ran on the legacy default stream. That stream waits for every
+  other blocking stream in the process, and holds them up, so each camera's line-fit scan waited on
+  the other cameras' GPU work. Now it runs on the detector's own stream.
+- **Checked:** the same replay as `bos-04`, 3,567 detections, byte-identical with the graph on
+  and off (with `bos-06`), and against the original build.
+- **`fieldcal_detect` hung** during that replay once the CPU was busy. Its decode threads waited
+  only for a ring slot to read free, and a slot also reads free while another thread is still
+  decoding the frame one ring earlier into it. Two threads then filled the same slot, one
+  "ready" was lost, and the detect loop waited forever (it could also have detected the wrong
+  frame's pixels). Now a thread starts frame `i` only after the detect loop has consumed frame
+  `i - ring`.
+- **Measured live** (alternating 3 times): GPU **25.6%** against 27.6% (the gaps between 13 small
+  launches), detect 1.20 against 1.23 ms, CPU unchanged (1.23 cores). The remaining CPU isn't
+  launch overhead any more (below).
+
+#### Where the remaining CPU goes (4 cameras, 1.2 cores)
+
+- **`tests/cpu-profile.sh`:** the 4 camera threads (15–25% of a core each) split their samples
+  between `grabRawSinkFrameTimeoutLastTime` (waiting for the camera), `decodeMjpegGray` and
+  `processimage`.
+- **Page faults** ~1/s: buffers are reused, allocation costs nothing.
+- **System calls** (function tracer, 0.36 s; the kernel refuses `set_ftrace_filter`, so it traced
+  everything), per second: futex ~44,000, `mprotect` ~11,000, `sched_yield` ~9,800, `getpid`
+  ~9,800, ioctl ~8,700, openat/close ~1,600/1,900.
+- **Where from** (gdb `catch syscall`): `mprotect` and `sched_yield` come from inside libcuda's
+  `cudaEventSynchronize`, which is how its blocking wait works. `getpid` and `openat` come from
+  NVIDIA's JPEG engine driver (`libnvvideo` → `libnvrm_host1x`), which opens `/dev/dri` and
+  `/dev/dri/renderD128` and pushes host1x command streams for every frame, on one helper thread
+  per camera (~2.4% of a core each). Both are inside NVIDIA's libraries.
+
+#### Latency: where a frame's ~14.5 ms go
+
+The dashboard shows 14.3–15.2 ms per camera: mid-exposure to the result.
+- **New in the `971 jpeg` line:** `frame age at decode` is how old each frame is when its decode
+  starts, from cscore's timestamp. That's `WPI_TIMESRC_V4L_SOE` (source 3), which our driver sets
+  at the frame's first USB packet. The line also has `JPEG avg` (KB).
+- **Measured** (4 cameras, 122 fps): age at decode 8.2 ms on average (max ~16), JPEG 34–36 KB.
+- **Split with the kernel log:** `/tmp/spectrum-971-kmsg` makes the decoder write each decode start
+  to `/dev/kmsg`, next to uvcvideo's "Frame complete" lines (`trace=128`). Over 393 ms:
+  **first packet to last packet 8.1 ms** on every camera, **last packet to decode start
+  0.15 ms**.
+- **So the camera sets the pace, not USB and not PhotonVision.** At alt 7 (1280 bytes per 125 µs)
+  34 KB would cross in 3.4 ms, but the camera spreads each frame over ~8.1 ms, about one frame
+  period: it sends the JPEG while the sensor reads out. So the bandwidth cap doesn't add the ~2 ms
+  latency estimated in VISION-RESEARCH.md.
+- **Budget:** ~2.5 ms (half the 5 ms exposure) + 8.1 ms (camera readout and send) + ~2.8 ms (JPEG
+  decode, 4 cameras sharing the 2 engines) + 1.2 ms (detection) ≈ 14.6 ms.
+
+#### A camera stuck at 320x240, again: the real cause (`photonvision-37`)
+
+`photonvision-27`'s recovery never fixed it. Twice tonight (00:12 and 01:14) TopRight came up at
+320x240; the "reconnecting it so the mode is applied again" warning repeated every 3 s for minutes,
+and only a PhotonVision restart helped.
+- **Chain of events,** from the logs and cscore's source
+  (`allwpilib-v2026.2.1/cscore/src/main/native/linux/UsbCameraImpl.cpp`):
+  1. On first connect, with no mode set yet, cscore applies the camera's **lowest** mode:
+     "set format 1 res 320x240" (`DeviceCacheMode`).
+  2. PhotonVision sets 1280x800. The resolution changed, so cscore closes the device, reopens it
+     and calls `VIDIOC_S_FMT`, which failed with **`Device or resource busy`** both times, and so
+     did `VIDIOC_S_PARM` (cscore logs these as `ioctl VIDIOC_S_FMT failed ...`). In uvcvideo,
+     EBUSY there means another handle still owns the stream: the old one, not yet released.
+     Probably a control read from another thread still held it (PhotonVision caches and sets
+     properties at the same moment). No other process had the camera open, and Java's
+     `ProcessBuilder` closes inherited file descriptors.
+  3. cscore keeps 1280x800 as its mode anyway, so `USBFrameProvider` sees 320x240 frames against
+     1280x800.
+  4. `GenericUSBCameraSettables` logged "Failed to set video mode!" when `setVideoMode` returned
+     **true** (success), so it printed on every start and hid the real failure.
+  5. The recovery set `kForceClose`, then `kAutoManage`. In cscore's Linux camera loop that only
+     stops and restarts streaming (`m_streaming && !IsEnabled()` → `DeviceStreamOff`). The device is
+     never reopened and the format never sent again, and setting the same mode is a no-op.
+- **Fix:** `reconnectForVideoMode` switches the camera to another mode of the same pixel format,
+  then back (`camera.setVideoMode(other)`, `camera.setVideoMode(want)`). Two real changes, each
+  reopening the device and setting its format, whatever state the race left. The warning now says
+  "applying the mode again ... switching through WxH". The inverted log now warns only on a real
+  failure.
+- **Not yet seen in action:** 8 starts in a row after the fix came up clean (below).
+
+#### A camera's thread killed at startup (`photonvision-38`)
+
+- **What happened:** on one start, TopLeft's `VisionRunner` thread died with
+  `ConcurrentModificationException` in `UIPhotonConfiguration.programStateToUi`. That's called
+  from `VisionRunner.update` once its camera connects, and it iterates `VisionModuleManager`'s
+  module list, a plain `ArrayList`, while `VisionSourceManager` is still adding cameras. The
+  camera stayed at cscore's first-connect 320x240 and was never processed, until a restart. It's
+  in the logs twice since 2026-09-24.
+- **Fix:** the list is a `CopyOnWriteArrayList` (it changes only when cameras are added or
+  removed), and `VisionRunner` catches any exception building the UI state, logging "Couldn't send
+  the settings to the UI" instead of dying.
+
+#### No copy of each gray frame (`photonvision-37`)
+
+- **What:** `GrayscalePipe` copied every gray frame (1 MB at 1280x800) into `processedImage`,
+  although it was already gray: 4 cameras × 122 fps ≈ 480 MB/s of memcpy. Now it shares the pixels
+  (`Mat.assignTo`: OpenCV counts the references, so either Mat can be released first).
+- **Where it matters:** only the dashboard stream draws on a frame (`OutputStreamPipeline` resizes
+  and draws on both `colorImage` and `processedImage` in place), and so does Aruco's debug-threshold
+  view. So `Frame.unshareProcessed()` gives `processedImage` its own copy right before a frame goes
+  to the stream (at most 30 a second, `photonvision-15`) or to that debug view. Detection is always
+  finished with the frame by then.
 
 ## Changes from the handoff
 

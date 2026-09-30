@@ -1,0 +1,39 @@
+diff --git a/photon-client/src/components/dashboard/CameraAndPipelineSelectCard.vue b/photon-client/src/components/dashboard/CameraAndPipelineSelectCard.vue
+index a4aae09e..f1d28e8e 100644
+--- a/photon-client/src/components/dashboard/CameraAndPipelineSelectCard.vue
++++ b/photon-client/src/components/dashboard/CameraAndPipelineSelectCard.vue
+@@ -89,7 +89,11 @@ const cancelCameraNameEdit = () => {
+ 
+ // Pipeline Name Edit
+ const pipelineNamesWrapper = computed<SelectItem[]>(() => {
+-  const pipelineNames = useCameraSettingsStore().pipelineNames.map((name, index) => ({ name: name, value: index }));
++  // SpectrumJetson (photonvision-47): the number too, since profiles and Switch all go by number.
++  const pipelineNames = useCameraSettingsStore().pipelineNames.map((name, index) => ({
++    name: `${index}: ${name}`,
++    value: index
++  }));
+ 
+   if (useCameraSettingsStore().isDriverMode) {
+     pipelineNames.push({ name: "Driver Mode", value: WebsocketPipelineType.DriverMode });
+diff --git a/photon-client/src/views/CameraMatchingView.vue b/photon-client/src/views/CameraMatchingView.vue
+index 6570a5d0..ca52923c 100644
+--- a/photon-client/src/views/CameraMatchingView.vue
++++ b/photon-client/src/views/CameraMatchingView.vue
+@@ -212,7 +212,7 @@ const getMatchedDevice = (info: PVCameraInfo | undefined): PVCameraInfo => {
+                 </tr>
+                 <tr>
+                   <td>Pipelines</td>
+-                  <td>{{ module.pipelineNicknames.join(", ") }}</td>
++                  <td>{{ module.pipelineNicknames.map((name, index) => `${index}: ${name}`).join(", ") }}</td>
+                 </tr>
+                 <tr>
+                   <td>Calibrations</td>
+@@ -322,7 +322,7 @@ const getMatchedDevice = (info: PVCameraInfo | undefined): PVCameraInfo => {
+                 </tr>
+                 <tr>
+                   <td>Pipelines</td>
+-                  <td>{{ module.pipelineNicknames.join(", ") }}</td>
++                  <td>{{ module.pipelineNicknames.map((name, index) => `${index}: ${name}`).join(", ") }}</td>
+                 </tr>
+                 <tr>
+                   <td>Calibrations</td>

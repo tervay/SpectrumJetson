@@ -1,0 +1,109 @@
+--- a/third_party/971apriltag/apriltag.cc
++++ b/third_party/971apriltag/apriltag.cc
+@@ -94,6 +94,16 @@
+ constexpr size_t kBlobDiffBlockWidth = 32;
+ constexpr size_t kBlobDiffBlockHeight = 16;
+ // BlobDiff's grid: overlap 1 on each side in x, and 1 in y.
++// SpectrumJetson (bos-07): pixels the mask ignores (0) become "no contrast" (127), which
++// BlobDiff skips, so nothing is found there.
++__global__ void ApplyMask(uint8_t* thresholded, const uint8_t* mask, size_t n) {
++  const size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x;
++  if (i < n && mask[i] == 0) thresholded[i] = 127;
++}
++void LaunchApplyMask(uint8_t* thresholded, const uint8_t* mask, size_t n, cudaStream_t stream) {
++  ApplyMask<<<(n + 255) / 256, 256, 0, stream>>>(thresholded, mask, n);
++}
++
+ dim3 BlobDiffBlocks(size_t decimated_width, size_t decimated_height) {
+   return dim3((decimated_width + kBlobDiffBlockWidth - 3) / (kBlobDiffBlockWidth - 2),
+               (decimated_height + kBlobDiffBlockHeight - 2) / (kBlobDiffBlockHeight - 1), 1);
+@@ -198,6 +208,7 @@
+       gray_image_device_(width * height),
+       decimated_image_device_(width / 2 * height / 2),
+       thresholded_image_device_(width / 2 * height / 2),
++      mask_device_(width / 2 * height / 2),
+       union_markers_device_(width / 2 * height / 2),
+       union_markers_size_device_(width / 2 * height / 2),
+       union_marker_pair_device_((width / 2 - 2) * (height / 2 - 2) * 4),
+@@ -846,7 +857,13 @@
+   }
+   return !first_stage_exec_ ||
+          first_stage_image_ != FirstStageInput(image_device, gray_image_device_.get()) ||
+-         first_stage_mwbd_ != tag_detector_->qtp.min_white_black_diff;
++         first_stage_mwbd_ != tag_detector_->qtp.min_white_black_diff ||
++         first_stage_mask_ != mask_on_;
++}
++
++void GpuDetector::SetMask(const uint8_t* decimated_mask) {
++  mask_on_ = decimated_mask != nullptr;
++  if (mask_on_) mask_device_.MemcpyAsyncFrom(decimated_mask, &stream_);
+ }
+ 
+ absl::Status GpuDetector::RecordFirstStageGraph(const uint8_t* image_device) {
+@@ -867,6 +884,10 @@
+   union_markers_size_device_.MemsetAsync(0u, &stream_);
+   threshold_->ThresholdAndDecimate(image_device, decimated_image_device_.get(),
+                                    thresholded_image_device_.get(), mwbd, &stream_);
++  if (mask_on_) {
++    LaunchApplyMask(thresholded_image_device_.get(), mask_device_.get(),
++                    thresholded_image_device_.size(), stream_.get());
++  }
+   LabelImage(ToGpuImage(thresholded_image_device_), ToGpuImage(union_markers_device_),
+              ToGpuImage(union_markers_size_device_), stream_.get());
+   num_compressed_union_marker_pair_device_.MemsetAsync(0, &stream_);
+@@ -895,6 +916,7 @@
+   }
+   first_stage_image_ = image_device;
+   first_stage_mwbd_ = mwbd;
++  first_stage_mask_ = mask_on_;
+   first_stage_failed_ = false;
+   return absl::OkStatus();
+ }
+@@ -910,7 +932,8 @@
+   const bool graph = fused && !timing && SpectrumGraphFirstStage() && first_stage_exec_ &&
+                      first_stage_image_ ==
+                          FirstStageInput(image_device, gray_image_device_.get()) &&
+-                     first_stage_mwbd_ == tag_detector_->qtp.min_white_black_diff;
++                     first_stage_mwbd_ == tag_detector_->qtp.min_white_black_diff &&
++                     first_stage_mask_ == mask_on_;
+ 
+   if (!graph) {
+     union_markers_size_device_.MemsetAsync(0u, &memset_stream_);
+@@ -943,6 +966,10 @@
+                                    tag_detector_->qtp.min_white_black_diff,
+                                    &stream_);
+ 
++  if (mask_on_) {
++    LaunchApplyMask(thresholded_image_device_.get(), mask_device_.get(),
++                    thresholded_image_device_.size(), stream_.get());
++  }
+   if (timing) after_threshold_.Record(&stream_);
+ 
+   if (image_format_ != vision::ImageFormat::MONO8) {
+--- a/third_party/971apriltag/apriltag.h
++++ b/third_party/971apriltag/apriltag.h
+@@ -108,6 +108,12 @@
+   bool FirstStageGraphWanted(const uint8_t* image_device);
+   absl::Status RecordFirstStageGraph(const uint8_t* image_device);
+ 
++  // SpectrumJetson (bos-07): a detection mask at the decimated size ((width/2) x (height/2), 1 =
++  // search here, 0 = ignore), or nullptr for none. Ignored pixels become "no contrast" (127)
++  // right after thresholding, so no blob, edge or tag is found there. The bytes are copied on
++  // this detector's stream: keep them alive until the next Detect() returns.
++  void SetMask(const uint8_t* decimated_mask);
++
+   const std::vector<QuadCorners>& FitQuads() const;
+ 
+   const zarray_t* Detections() const { return detections_; }
+@@ -402,6 +408,11 @@
+   const uint8_t* first_stage_image_ = nullptr;
+   int first_stage_mwbd_ = -1;
+   bool first_stage_failed_ = false;  // recording failed: don't try again (this detector)
++  bool first_stage_mask_ = false;    // whether the recorded graph masks
++
++  // SpectrumJetson (bos-07): SetMask's mask on the GPU, and whether it's on.
++  GpuMemory<uint8_t> mask_device_;
++  bool mask_on_ = false;
+ 
+   // Cached quantities used for tag filtering.
+   bool normal_border_ = false;

@@ -1,0 +1,132 @@
+--- a/photon-client/src/stores/settings/CameraSettingsStore.ts
++++ b/photon-client/src/stores/settings/CameraSettingsStore.ts
+@@ -44,12 +44,14 @@
+     currentWebsocketPipelineType(): WebsocketPipelineType {
+       return this.currentPipelineType - 3;
+     },
+-    currentVideoFormat(): VideoFormat {
++    // Upstream #2617 (photonvision-42): undefined while a camera's video modes aren't known yet
++    // (activating, or a stale mode index); callers must allow for it.
++    currentVideoFormat(): VideoFormat | undefined {
+       return this.currentCameraSettings.validVideoFormats[this.currentPipelineSettings.cameraVideoModeIndex];
+     },
+     isCurrentVideoFormatCalibrated(): boolean {
+       return this.currentCameraSettings.completeCalibrations.some((v) =>
+-        resolutionsAreEqual(v.resolution, this.currentVideoFormat.resolution)
++        resolutionsAreEqual(v.resolution, this.currentVideoFormat?.resolution)
+       );
+     },
+     cameraNames(): string[] {
+@@ -463,7 +465,7 @@
+       useStateStore().websocket?.send(payload, true);
+     },
+     getCalibrationCoeffs(
+-      resolution: Resolution,
++      resolution: Resolution | undefined,
+       cameraUniqueName: string = useStateStore().currentCameraUniqueName
+     ): CameraCalibrationResult | undefined {
+       return this.cameras[cameraUniqueName].completeCalibrations.find((v) =>
+--- a/photon-client/src/components/cameras/CamerasView.vue
++++ b/photon-client/src/components/cameras/CamerasView.vue
+@@ -22,7 +22,7 @@
+ 
+ const fpsTooLow = computed<boolean>(() => {
+   const currFPS = useStateStore().currentPipelineResults?.fps || 0;
+-  const targetFPS = useCameraSettingsStore().currentVideoFormat.fps;
++  const targetFPS = useCameraSettingsStore().currentVideoFormat?.fps || 0;
+   const driverMode = useCameraSettingsStore().isDriverMode;
+   const gpuAccel = useSettingsStore().general.gpuAcceleration !== undefined;
+   const isReflective = useCameraSettingsStore().currentPipelineSettings.pipelineType === PipelineType.Reflective;
+--- a/photon-client/src/components/cameras/CameraCalibrationCard.vue
++++ b/photon-client/src/components/cameras/CameraCalibrationCard.vue
+@@ -76,7 +76,8 @@
+   }));
+ const calibrationDivisors = computed(() =>
+   [1, 2, 4].filter((v) => {
+-    const currentRes = useCameraSettingsStore().currentVideoFormat.resolution;
++    const currentRes = useCameraSettingsStore().currentVideoFormat?.resolution;
++    if (!currentRes) return v === 1;
+     return (currentRes.width / v >= 300 && currentRes.height / v >= 220) || v === 1;
+   })
+ );
+@@ -86,7 +87,7 @@
+ // Use a watchEffect so the value is populated/reacts when the stores become available or update.
+ // This avoids trying to index into an array that may be empty during page reload.
+ watchEffect(() => {
+-  const currentIndex = useCameraSettingsStore().currentVideoFormat.index ?? 0;
++  const currentIndex = useCameraSettingsStore().currentVideoFormat?.index ?? 0;
+   useStateStore().calibrationData.videoFormatIndex = currentIndex;
+   const names = useCameraSettingsStore().currentCameraSettings.validVideoFormats.map((f) =>
+     getResolutionString(f.resolution)
+--- a/photon-client/src/components/dashboard/CamerasCard.vue
++++ b/photon-client/src/components/dashboard/CamerasCard.vue
+@@ -24,7 +24,7 @@
+ 
+ const fpsTooLow = computed<boolean>(() => {
+   const currFPS = useStateStore().currentPipelineResults?.fps || 0;
+-  const targetFPS = useCameraSettingsStore().currentVideoFormat.fps;
++  const targetFPS = useCameraSettingsStore().currentVideoFormat?.fps || 0;
+   const driverMode = useCameraSettingsStore().isDriverMode;
+   const gpuAccel = useSettingsStore().general.gpuAcceleration !== undefined;
+   const isReflective = useCameraSettingsStore().currentPipelineSettings.pipelineType === PipelineType.Reflective;
+--- a/photon-client/src/components/dashboard/tabs/InputTab.vue
++++ b/photon-client/src/components/dashboard/tabs/InputTab.vue
+@@ -36,7 +36,8 @@
+ 
+ const streamDivisors = [1, 2, 4, 6];
+ const getFilteredStreamDivisors = (): number[] => {
+-  const currentResolutionWidth = useCameraSettingsStore().currentVideoFormat.resolution.width;
++  const currentResolutionWidth = useCameraSettingsStore().currentVideoFormat?.resolution.width;
++  if (!currentResolutionWidth) return [];
+   return streamDivisors.filter(
+     (x) =>
+       useCameraSettingsStore().isDriverMode ||
+@@ -64,7 +65,8 @@
+ 
+ const streamResolutions = computed(() => {
+   const streamDivisors = getFilteredStreamDivisors();
+-  const currentResolution = useCameraSettingsStore().currentVideoFormat.resolution;
++  const currentResolution = useCameraSettingsStore().currentVideoFormat?.resolution;
++  if (!currentResolution) return [];
+   return streamDivisors.map(
+     (x) =>
+       `${getResolutionString({
+--- a/photon-client/src/lib/PhotonUtils.ts
++++ b/photon-client/src/lib/PhotonUtils.ts
+@@ -2,8 +2,8 @@
+ import type { Resolution } from "@/types/SettingTypes";
+ import axios from "axios";
+ 
+-export const resolutionsAreEqual = (a: Resolution, b: Resolution) => {
+-  return a.height === b.height && a.width === b.width;
++export const resolutionsAreEqual = (a: Resolution, b?: Resolution) => {
++  return a.height === b?.height && a.width === b?.width;
+ };
+ 
+ /**
+--- a/photon-client/src/components/app/photon-camera-stream.vue
++++ b/photon-client/src/components/app/photon-camera-stream.vue
+@@ -37,7 +37,11 @@
+     return { aspectRatio: "1/1" };
+   }
+   const resolution =
+-    props.cameraSettings.validVideoFormats[props.cameraSettings.pipelineSettings.cameraVideoModeIndex].resolution;
++    props.cameraSettings.validVideoFormats[props.cameraSettings.pipelineSettings.cameraVideoModeIndex]?.resolution;
++  // photonvision-42: an out-of-range mode index (camera activating) would throw here
++  if (!resolution) {
++    return { aspectRatio: "1/1" };
++  }
+   const rotation = props.cameraSettings.pipelineSettings.inputImageRotationMode;
+   if (rotation === 1 || rotation === 3) {
+     return {
+--- a/photon-client/src/components/app/photon-3d-visualizer.vue
++++ b/photon-client/src/components/app/photon-3d-visualizer.vue
+@@ -31,7 +31,7 @@
+ const calibrationCoeffs = useCameraSettingsStore().getCalibrationCoeffs(
+   useCameraSettingsStore().currentCameraSettings.validVideoFormats[
+     useCameraSettingsStore().currentPipelineSettings.cameraVideoModeIndex
+-  ].resolution
++  ]?.resolution
+ );
+ 
+ const props = defineProps<{

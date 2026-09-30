@@ -1,0 +1,74 @@
+--- a/photon-core/src/main/java/org/photonvision/vision/frame/provider/USBFrameProvider.java
++++ b/photon-core/src/main/java/org/photonvision/vision/frame/provider/USBFrameProvider.java
+@@ -429,14 +429,27 @@
+      * format.
+      */
+     private void reconnectForVideoMode(int width, int height, int attempt) {
+-        String why =
++        reconnectCamera(
+                 "The camera is sending frames that aren't "
+                         + width
+                         + "x"
+                         + height
+                         + ", the video mode PhotonVision set; applying the mode again (attempt "
+                         + attempt
+-                        + ")";
++                        + ")");
++    }
++
++    /**
++     * Closes and reopens the camera in cscore (photonvision-27, -29). Shared by the video-mode fix and
++     * the stuck-camera watchdog, which share one throttle.
++     */
++    private void reconnectCamera(String why) {
++        stuckWatchdog.noteReconnect();
++        // SpectrumJetson (photonvision-43): really reopen the device. kForceClose (below) only stops
++        // and restarts streaming in cscore's Linux camera: the device stays open, nothing is
++        // re-negotiated, and the format isn't sent again. A change of resolution does reopen it
++        // (DeviceCmdSetMode: stream off, close, open, set the format, stream on), so switch to
++        // another mode and back: two real reopens, the second at the wanted mode.
+         VideoMode want = camera.getVideoMode();
+         VideoMode other = null;
+         try {
+@@ -449,23 +462,13 @@
+         } catch (Exception e) {
+             other = null;
+         }
+-        if (other == null) {
+-            reconnectCamera(why + " (no other mode to switch through; reconnecting)");
++        if (other != null) {
++            logger.warn(why + ": reopening it (switching through " + other.width + "x" + other.height + ")");
++            camera.setVideoMode(other);
++            camera.setVideoMode(want);
+             return;
+         }
+-        logger.warn(why + ": switching through " + other.width + "x" + other.height);
+-        stuckWatchdog.noteReconnect();
+-        camera.setVideoMode(other);
+-        camera.setVideoMode(want);
+-    }
+-
+-    /**
+-     * Closes and reopens the camera in cscore (photonvision-27, -29). Shared by the video-mode fix and
+-     * the stuck-camera watchdog, which share one throttle.
+-     */
+-    private void reconnectCamera(String why) {
+-        logger.warn(why);
+-        stuckWatchdog.noteReconnect();
++        logger.warn(why + ": no other video mode to reopen it with; restarting its stream");
+         camera.setConnectionStrategy(VideoSource.ConnectionStrategy.kForceClose);
+         long deadline = System.nanoTime() + 1_000_000_000L;
+         while (camera.isConnected() && System.nanoTime() < deadline) {
+--- a/photon-core/src/main/java/org/photonvision/vision/frame/provider/StuckCameraWatchdog.java
++++ b/photon-core/src/main/java/org/photonvision/vision/frame/provider/StuckCameraWatchdog.java
+@@ -28,7 +28,9 @@
+  * pipeline, while the camera still looked connected. A PhotonVision restart or a replug fixed it.
+  *
+  * <ul>
+- *   <li>No good frame for 3 s: reconnect the camera (close and reopen it in cscore).
++ *   <li>No good frame for 3 s: reconnect the camera: close and reopen the device in cscore
++ *       (photonvision-43: by switching to another video mode and back; before, a kForceClose only
++ *       restarted the stream).
+  *   <li>Still none 5 s after a reconnect: reset it at the USB level (like a replug), at most every 30
+  *       s while it stays stuck.
+  *   <li>Reconnects for a video-mode mismatch (photonvision-27) share the throttle, so the two never
